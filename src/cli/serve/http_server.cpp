@@ -12,6 +12,8 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +26,7 @@
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -281,6 +284,13 @@ bool HasHeader(const HttpResponse& response, std::string_view name) {
   const std::string lowered = ToLower(name);
   return std::ranges::any_of(response.headers, [&](const auto& header) {
     return ToLower(header.first) == lowered;
+  });
+}
+
+bool IsEventStream(const HttpResponse& response) {
+  return std::ranges::any_of(response.headers, [](const auto& header) {
+    return ToLower(header.first) == "content-type" &&
+           ToLower(header.second).starts_with("text/event-stream");
   });
 }
 
@@ -1520,11 +1530,49 @@ void HttpServer::handle_connection(int client_fd) {
       response_started = true;
       connected = SendAll(client_fd, head);
       if (connected) {
-        resp.streaming_body([&](std::string_view chunk) {
-          connected = connected && (chunked ? SendChunk(client_fd, chunk)
-                                            : SendAll(client_fd, chunk));
+        std::mutex write_mutex;
+        std::condition_variable_any write_cv;
+        auto last_write = std::chrono::steady_clock::now();
+        const auto send_body = [&](std::string_view chunk) {
+          const std::lock_guard lock(write_mutex);
+          if (!connected)
+            return false;
+          connected =
+              chunked ? SendChunk(client_fd, chunk) : SendAll(client_fd, chunk);
+          if (connected && !chunk.empty()) {
+            last_write = std::chrono::steady_clock::now();
+          }
           return connected;
-        });
+        };
+        std::jthread heartbeat;
+        if (IsEventStream(resp) &&
+            options_.sse_heartbeat_interval.count() > 0) {
+          heartbeat = std::jthread([&](std::stop_token stop) {
+            std::unique_lock lock(write_mutex);
+            while (!stop.stop_requested() && connected) {
+              const auto deadline =
+                  last_write + options_.sse_heartbeat_interval;
+              // Stop-aware waiting cannot miss a stop requested just before
+              // sleeping. Ordinary writes only move the deadline; they need
+              // not wake a second thread for every generated token.
+              write_cv.wait_until(lock, stop, deadline,
+                                  [&] { return !connected; });
+              if (!stop.stop_requested() && connected &&
+                  std::chrono::steady_clock::now() >=
+                      last_write + options_.sse_heartbeat_interval) {
+                // SSE comments carry bytes without changing the API event
+                // stream.
+                connected = chunked ? SendChunk(client_fd, ": ping\n\n")
+                                    : SendAll(client_fd, ": ping\n\n");
+                last_write = std::chrono::steady_clock::now();
+              }
+            }
+          });
+        }
+        resp.streaming_body(send_body);
+        heartbeat.request_stop();
+        if (heartbeat.joinable())
+          heartbeat.join();
         // An SSE error is a complete protocol response. A failed raw PCM
         // stream must remain incomplete, or it looks like valid shorter audio.
         if (connected && chunked &&
