@@ -160,6 +160,75 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
   const std::uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(streams) * hidden;
   const float* x = xn + static_cast<std::size_t>(t) * hc_dim;
+  if (streams == 4) {
+    // Decode's inputs are cold (the GEMVs before evicted them): issue every
+    // load, inject weights included, before the first store. Same float
+    // operations in the same order as the loop below.
+    constexpr std::uint32_t kS = 4;
+    float v4[kS];
+    float g4[kS];
+    float w4[kS][kS];
+#pragma unroll
+    for (std::uint32_t s = 0; s < kS; ++s) {
+      const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
+      v4[s] = i < hidden ? x[idx] : 0.0f;
+      g4[s] = i < hidden ? gate[static_cast<std::size_t>(t) * hc_dim + idx]
+                         : 0.0f;
+    }
+    if (inject_w != nullptr) {
+#pragma unroll
+      for (std::uint32_t o = 0; o < kS; ++o) {
+#pragma unroll
+        for (std::uint32_t s = 0; s < kS; ++s) {
+          w4[o][s] = i < hidden ? inject_w[o * hc_dim +
+                                           static_cast<std::size_t>(s) * hidden +
+                                           i]
+                                : 0.0f;
+        }
+      }
+    }
+    float acc4 = 0.0f;
+#pragma unroll
+    for (std::uint32_t s = 0; s < kS; ++s) {
+      if (i < hidden) {
+        acc4 += v4[s] * SigmoidF(g4[s]);
+      }
+    }
+    if (i < hidden) {
+      mixed[static_cast<std::size_t>(t) * hidden + i] =
+          acc4 / static_cast<float>(streams);
+    }
+    if (inject_w == nullptr) {
+      return;
+    }
+    __shared__ float partial4[kS][kThreads / 32];
+    const std::uint32_t lane4 = threadIdx.x % warpSize;
+    const std::uint32_t wave4 = threadIdx.x / warpSize;
+#pragma unroll
+    for (std::uint32_t o = 0; o < kS; ++o) {
+      float dot = 0.0f;
+      if (i < hidden) {
+#pragma unroll
+        for (std::uint32_t s = 0; s < kS; ++s) {
+          dot += w4[o][s] * v4[s];
+        }
+      }
+      dot = WaveSum(dot);
+      if (lane4 == 0) {
+        partial4[o][wave4] = dot;
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < kS) {
+      float total = 0.0f;
+      for (std::uint32_t w = 0; w < blockDim.x / warpSize; ++w) {
+        total += partial4[threadIdx.x][w];
+      }
+      inject[(static_cast<std::size_t>(t) * kS + threadIdx.x) * gridDim.y +
+             blockIdx.y] = total;
+    }
+    return;
+  }
   float v[kMaxStreams];
   float acc = 0.0f;
   for (std::uint32_t s = 0; s < streams; ++s) {
@@ -437,6 +506,61 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   __shared__ float shared[32];
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t s = blockIdx.y;
+  constexpr std::uint32_t kMaxPer = 16;
+  if (xn_q8 == nullptr && hidden <= kMaxPer * blockDim.x) {
+    // Decode runs one block per (token, stream) on cold inputs: issue every
+    // load (residual, block output, gamma) up front and keep the updated
+    // residual in registers. Same float operations in the same order as the
+    // loops below, so the result is bit-identical.
+    const std::size_t base0 =
+        (static_cast<std::size_t>(t) * streams + s) * hidden;
+    float* dst0 = res + base0;
+    const float* src0 = block_out + static_cast<std::size_t>(t) * hidden;
+    const float* g0 =
+        gamma == nullptr ? nullptr : gamma + static_cast<std::size_t>(s) * hidden;
+    float r[kMaxPer];
+    float b[kMaxPer];
+    float gg[kMaxPer];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kMaxPer; ++k) {
+      const std::uint32_t i = threadIdx.x + k * blockDim.x;
+      if (i < hidden) {
+        r[k] = dst0[i];
+        b[k] = src0[i];
+        gg[k] = g0 != nullptr ? g0[i] : 0.0f;
+      }
+    }
+    float logit0 = 0.0f;
+    for (std::uint32_t p = 0; p < inject_parts; ++p) {
+      logit0 +=
+          inject[(static_cast<std::size_t>(t) * streams + s) * inject_parts + p];
+    }
+    const float w0 = 2.0f * SigmoidF(logit0 / static_cast<float>(streams));
+    float ss0 = 0.0f;
+#pragma unroll
+    for (std::uint32_t k = 0; k < kMaxPer; ++k) {
+      const std::uint32_t i = threadIdx.x + k * blockDim.x;
+      if (i < hidden) {
+        const float v = r[k] + b[k] * w0;
+        dst0[i] = v;
+        ss0 += v * v;
+        r[k] = v;
+      }
+    }
+    if (gamma == nullptr) {
+      return;
+    }
+    ss0 = BlockSum(ss0, shared);
+    const float scale0 = rsqrtf(ss0 / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (std::uint32_t k = 0; k < kMaxPer; ++k) {
+      const std::uint32_t i = threadIdx.x + k * blockDim.x;
+      if (i < hidden) {
+        xn[base0 + i] = static_cast<XnT>(r[k] * scale0 * gg[k]);
+      }
+    }
+    return;
+  }
   float logit = 0.0f;
   for (std::uint32_t p = 0; p < inject_parts; ++p) {
     logit +=

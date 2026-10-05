@@ -21,7 +21,11 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/tuning.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/phase_profile.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/trace.hpp"
+
+// EXPERIMENT: phase stamps (GUFO_PHASE_PROFILE); no-ops outside a verify body.
+#define PS_MARK(p) Ps().Mark(stream_, PhaseStamps::p)
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -1257,6 +1261,10 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
                      std::string* error_msg) const {
   const Config& c = config();
+  const bool marks = inject != nullptr;  // the head mixer is its own phase
+  if (marks && !normed) {
+    PS_MARK(kMixNorm);
+  }
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
   // wide route or as F32 in s_.xn.
@@ -1287,6 +1295,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         Tune().fused_hc_down && !xn_half_ && !MatrixRows(n_tokens) &&
         m.down.type == GgmlType::kQ8_0 && m.down.rows == 320 &&
         m.down.cols == 10240 && c.hc_low_rank == 320;
+    if (marks) {
+      PS_MARK(kMixDown);
+    }
     if (xn_half_) {
       if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
                     m.down.cols, stream_)) {
@@ -1309,6 +1320,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
                 static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
     }
+    if (marks) {
+      PS_MARK(kMixUp);
+    }
     if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
       return false;
     }
@@ -1324,6 +1338,9 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // projections that follow read.
   q8t_src_ = nullptr;
   half_src_ = nullptr;
+  if (marks) {
+    PS_MARK(kMixEpi);
+  }
   if (xn_half_) {
     if (fused_projection) {
       if (!HcMixF16Gemm(m.up.data, reinterpret_cast<const __half*>(s_.hc_gate),
@@ -1521,6 +1538,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   std::uint32_t qkv_stride = channels;
   std::uint32_t z_stride = c.SsmValueDim();
   bool convolved = false;
+  PS_MARK(kGdnIn);
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
@@ -1547,10 +1565,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       return false;
     }
   }
+  PS_MARK(kGdnAb);
   if (!projections_ready &&
       !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
+  PS_MARK(kGdnCore);
   // Keep the same activation precision across prefill chunk boundaries.
   // The F16 epilogue reuses the F32 output allocation. Switching this
   // projection to Q8 for a short tail changes every subsequent layer.
@@ -1573,6 +1593,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!project_output) {
     return true;
   }
+  PS_MARK(kGdnOut);
   if (half_output) {
     if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,
                       l.ssm_out.cols, stream_)) {
@@ -1606,6 +1627,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
+  PS_MARK(kAttnProj);
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && n_tokens >= 1024 &&
@@ -1663,6 +1685,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
   }
+  PS_MARK(kAttnCore);
 
   // Raw keys survive only until pooling. The ring holds the initial
   // pre-budget backlog and a batch, independently for trunk and predictor.
@@ -1735,6 +1758,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   c.compress_ratio, stream_);
   SigmoidMul(s_.ctx, s_.attn_gate,
              static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
+  if (project_output) {
+    PS_MARK(kAttnOut);
+  }
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
 }
 
@@ -1743,6 +1769,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
+  PS_MARK(kRouter);
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
@@ -1765,6 +1792,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
   shexp_half_ready_ = false;
+  PS_MARK(kShared);
   if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                   &l.shexp_down, error_msg)) {
     return false;
@@ -1800,6 +1828,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       throw;
     }
   }
+  PS_MARK(kRouted);
   return MoeExperts(l, x, out, n_tokens, error_msg);
 }
 
@@ -1892,12 +1921,14 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                       n_tokens, used, error_msg)) {
       return false;
     }
+    PS_MARK(kRoutedDown);
     // The down projection sees one (token, slot) row per expert id.
     if (!Experts(l.ffn_down_exps, s_.gate_e, s_.ids, s_.down_e, slots, 1,
                  n_tokens, error_msg)) {
       return false;
     }
   }
+  PS_MARK(kRoutedEpi);
   if (wmma_experts) {
     // The combine that follows folds this epilogue into its own pass when
     // it takes the F16 route (Combine); otherwise it runs here.
@@ -1942,10 +1973,15 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   // token ids before the host reads them.
   const bool subset = draft_ids_ != nullptr;
   const DeviceTensor& output = subset ? draft_head_ : model_->output();
-  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+  PS_MARK(kHeadMix);
+  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
     return false;
   }
+  PS_MARK(kHead);
+  if (!Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+    return false;
+  }
+  PS_MARK(kCand);
   if (candidates) {
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
                      output.rows, stream_);
@@ -2174,10 +2210,19 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (traced) {
     Tl().Gpu(stream_, Timeline::kPrefixEnd, n);
   }
+  const bool phased = Ps().Enabled() && graph;
   const auto body = [&] {
-    return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
-                       sparse, start_pos, graph ? graph_pool_grid : pool_grid,
-                       first_layer, c.num_layers, error_msg);
+    if (phased) {
+      Ps().BeginBody(key, stream_);
+    }
+    const bool ok = ForwardBody(
+        session, n, n_logits, logits != nullptr, speculative, sparse, start_pos,
+        graph ? graph_pool_grid : pool_grid, first_layer, c.num_layers,
+        error_msg);
+    if (phased) {
+      Ps().EndBody(stream_);
+    }
+    return ok;
   };
   // Only the suffix waits for its pinned n-gram rows. During eager
   // execution and capture, Ple performs this wait at the same boundary.
@@ -2201,6 +2246,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
   if (!ran || (flag_wait && !WaitBumped("forward", error_msg))) {
     return false;
+  }
+  if (phased) {
+    Ps().Collect(key, n);
   }
   if (traced) {
     Tl().Host(Timeline::kSynced);
@@ -2255,6 +2303,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
+    if (c.IsPleLayer(il)) {
+      PS_MARK(kPle);
+    }
     if (c.IsPleLayer(il) &&
         !Ple(l, session, n, s_.res, speculative, error_msg)) {
       return false;
@@ -2276,6 +2327,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
 
     // Each combine also norms the residual for the mixer that follows it,
     // unless PLE rewrites the residual first.
+    PS_MARK(kCombine);
     Combine(s_.res, l.hc_ffn.norm.f32(), n);
     if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, n, error_msg) ||
         !Moe(l, s_.mixed, s_.block_out, n, error_msg)) {
@@ -2286,6 +2338,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             ? (c.IsPleLayer(il + 1) ? nullptr
                                     : layers[il + 1].hc_attn.norm.f32())
             : model_->hc_head().norm.f32();
+    PS_MARK(kCombine);
     Combine(s_.res, next_norm, n);
     normed = next_norm != nullptr;
   }
@@ -2309,11 +2362,16 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     // offset into it is not addressable.
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
     const DeviceMixer& head = model_->hc_head();
+    PS_MARK(kHeadMix);
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
-               n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+               n_logits, error_msg)) {
       return false;
     }
+    PS_MARK(kHead);
+    if (!Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+      return false;
+    }
+    PS_MARK(kCand);
     if (download_logits &&
         !CopyPinned(
             s_.logits, logits_host_,
@@ -2943,10 +3001,19 @@ bool Executor::MtpForward(Session& session,
       (std::uint64_t{output.token != nullptr} << 41) |
       (std::uint64_t{output.candidates != nullptr} << 43) |
       (std::uint64_t{sparse} << 44);
+  const bool phased = Ps().Enabled() && graph;
   const auto body = [&] {
-    return MtpBody(session, n, pos, output.token != nullptr,
-                   output.candidates != nullptr, error_msg,
-                   graph ? graph_pool : pool, hidden_source, output.trace);
+    if (phased) {
+      Ps().BeginBody(key, stream_);
+    }
+    const bool ok = MtpBody(session, n, pos, output.token != nullptr,
+                            output.candidates != nullptr, error_msg,
+                            graph ? graph_pool : pool, hidden_source,
+                            output.trace);
+    if (phased) {
+      Ps().EndBody(stream_);
+    }
+    return ok;
   };
   // With Tuning::flag_waits a draft step waits on a completion flag instead
   // of synchronizing the stream (see Wait).
@@ -2963,6 +3030,9 @@ bool Executor::MtpForward(Session& session,
   }
   if (flag_wait && !WaitBumped("MTP forward", error_msg)) {
     return false;
+  }
+  if (phased) {
+    Ps().Collect(key, n, true);
   }
   if (traced) {
     Tl().Host(Timeline::kSynced);
@@ -3002,6 +3072,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                   hipMemcpyHostToDevice, stream_, "token upload", error_msg)) {
     return false;
   }
+  PS_MARK(kMtpIn);
   EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
               s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
   // MTP embeds shifted token IDs. Visual information arrives in the trunk
@@ -3072,6 +3143,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     if (!Dense(l.attn_out, s_.ctx, s_.block_out, tail_rows, error_msg))
       return false;
   }
+  PS_MARK(kCombine);
   Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows);
   if (trace && !copy_trace(s_.mtp_res + tail_last, trace->attention))
     return false;
@@ -3085,6 +3157,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       !Moe(l, s_.mixed, s_.block_out, tail_rows, error_msg, last_only)) {
     return false;
   }
+  PS_MARK(kCombine);
   Combine(s_.mtp_res, nullptr, tail_rows);
   if (trace &&
       !copy_trace(s_.block_out +
