@@ -24,6 +24,7 @@ struct BenchOptions {
   std::string logit_eval_path;
   std::string logit_out;
   std::string logit_schedules{"1:1,2,3,4,5,6,7,8"};
+  std::size_t logit_prefix{0};
   std::string speculative_backend{""};
   std::string mtp_model_path;
   std::string dflash_model_path;

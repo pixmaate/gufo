@@ -188,6 +188,25 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
       "(default: 1:1,2,3,4,5,6,7,8); a 'p' prefix (p8) uses the prefill "
       "arithmetic",
       "Validation", &opt.logit_schedules);
+  parser.AddCustomOption(
+      "", "--logit-prefix", "N",
+      "Prefill the first N --logit-eval tokens through the real chunked prompt "
+      "path before teacher forcing the rest, so every scored position depends "
+      "on wide-prefill state",
+      "Validation",
+      [&opt](std::string_view, std::string_view val, std::string* err) -> bool {
+        std::size_t num = 0;
+        const auto [ptr, ec] =
+            std::from_chars(val.data(), val.data() + val.size(), num);
+        if (ec != std::errc{} || ptr != val.data() + val.size() || num == 0) {
+          if (err != nullptr) {
+            *err = "Invalid argument for --logit-prefix";
+          }
+          return false;
+        }
+        opt.logit_prefix = num;
+        return true;
+      });
 
   const auto parse_speculative_backend =
       [&opt, &speculative_explicit](std::string_view, std::string_view value,
@@ -903,7 +922,8 @@ int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
   const std::string text((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
   const auto tokens = model.Tokenize(text);
-  if (tokens.size() < 2 || tokens.size() >= context) {
+  const std::size_t synced = std::max<std::size_t>(options.logit_prefix, 1);
+  if (tokens.size() < synced + 2 || tokens.size() >= context) {
     std::cerr << "Error: logit-eval text is " << tokens.size()
               << " tokens; it needs 2.." << context - 1 << '\n';
     return 1;
@@ -943,7 +963,7 @@ int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
                                 ? gufo::core::SessionMode::kSpeculative
                                 : gufo::core::SessionMode::kAutoregressive,
                             context, &error);
-    if (!session || !session->Sync(std::span(tokens).first(1), &error)) {
+    if (!session || !session->Sync(std::span(tokens).first(synced), &error)) {
       std::cerr << "Error: logit-eval session: " << error << '\n';
       return 1;
     }
@@ -966,7 +986,7 @@ int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
     double nll = 0;
     std::size_t count = 0;
     const auto start = std::chrono::steady_clock::now();
-    std::size_t p = 1;
+    std::size_t p = synced;
     for (std::size_t k = 0; p + 1 < tokens.size(); ++k) {
       const std::size_t width = std::min(schedules[s][k % schedules[s].size()],
                                          tokens.size() - 1 - p);
