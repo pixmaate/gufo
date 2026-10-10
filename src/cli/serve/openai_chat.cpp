@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/core/image.hpp"
@@ -1884,6 +1885,8 @@ HttpResponse StreamingResponse(
               stream_log->error_event_sent = writer(Sse(error));
               (void)writer("data: [DONE]\n\n");
             } catch (const std::exception& error) {
+              // Retain the cause in logs alongside the client's stable code.
+              Logger::Error("chat", error.what());
               stream_log->error_code = "generation_failed";
               json::Value err = json::Value::object();
               json::Value detail = json::Value::object();
@@ -1958,6 +1961,9 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
         throw;
       const auto* generation_error =
           dynamic_cast<const TextGenerationError*>(&error);
+      // Retain the cause in logs alongside the client's stable code.
+      if (generation_error == nullptr)
+        Logger::Error("chat", error.what());
       stream_log->error_code = generation_error
                                    ? generation_error->stable_code()
                                    : "generation_failed";
