@@ -32,6 +32,7 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/dashboard_html.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -943,6 +944,303 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend&) {
           .headers = {{"Content-Type", "text/plain; version=0.0.4"}}};
 }
 
+// ---------------------------------------------------------------------------
+// Dashboard endpoints
+// ---------------------------------------------------------------------------
+
+json::Value NumberOrNull(std::optional<double> value) {
+  return value.has_value() ? json::Value(*value) : json::Value();
+}
+
+json::Value CountOrNull(std::optional<std::uint64_t> value) {
+  return value.has_value()
+             ? json::Value(static_cast<unsigned long long>(*value))
+             : json::Value();
+}
+
+const char* ReasoningEffortName(gufo::ReasoningEffort effort) {
+  switch (effort) {
+    case gufo::ReasoningEffort::kMinimal:
+      return "minimal";
+    case gufo::ReasoningEffort::kLow:
+      return "low";
+    case gufo::ReasoningEffort::kMedium:
+      return "medium";
+    case gufo::ReasoningEffort::kHigh:
+      return "high";
+    case gufo::ReasoningEffort::kXHigh:
+      return "xhigh";
+    case gufo::ReasoningEffort::kMax:
+      return "max";
+  }
+  return "auto";
+}
+
+json::Value DashboardStatusJson(const dashboard::TelemetrySnapshot& snapshot,
+                                const TextGenerationBackend* backend,
+                                const VideoJobService* video_jobs,
+                                const TtsService* tts, const AsrService* asr,
+                                const ImageService* images) {
+  json::Value body = json::Value::object();
+
+  json::Value server = json::Value::object();
+  server["model"] =
+      backend != nullptr ? json::Value(backend->model_id()) : json::Value();
+  server["ready"] = backend != nullptr && backend->ready();
+  const auto info = backend != nullptr ? backend->model_info()
+                                       : TextGenerationBackend::ModelInfo{};
+  server["context"] = static_cast<unsigned long long>(info.context);
+  server["sessions"] = info.sessions;
+  server["speculative"] = info.speculative;
+  const auto defaults = backend != nullptr
+                            ? backend->sampling_defaults()
+                            : TextGenerationBackend::SamplingDefaults{};
+  json::Value sampling = json::Value::object();
+  sampling["max_tokens"] = defaults.max_tokens;
+  sampling["temperature"] = static_cast<double>(defaults.sampling.temperature);
+  sampling["top_k"] = defaults.sampling.top_k;
+  sampling["top_p"] = static_cast<double>(defaults.sampling.top_p);
+  sampling["min_p"] = static_cast<double>(defaults.sampling.min_p);
+  sampling["min_keep"] = defaults.sampling.min_keep;
+  sampling["seed"] = defaults.sampling.seed;
+  sampling["repeat_penalty"] =
+      static_cast<double>(defaults.sampling.repeat_penalty);
+  sampling["repeat_last_n"] = defaults.sampling.repeat_last_n;
+  server["sampling"] = std::move(sampling);
+  const auto reasoning =
+      backend != nullptr ? backend->reasoning_defaults() : ReasoningOptions{};
+  json::Value reasoning_obj = json::Value::object();
+  reasoning_obj["enabled"] = reasoning.enabled.has_value()
+                                 ? json::Value(*reasoning.enabled)
+                                 : json::Value();
+  reasoning_obj["effort"] =
+      reasoning.effort.has_value()
+          ? json::Value(ReasoningEffortName(*reasoning.effort))
+          : json::Value();
+  reasoning_obj["preserve_thinking"] =
+      reasoning.preserve_thinking.has_value()
+          ? json::Value(*reasoning.preserve_thinking)
+          : json::Value();
+  server["reasoning"] = std::move(reasoning_obj);
+  json::Value services = json::Value::object();
+  services["text"] = backend != nullptr;
+  services["video"] = video_jobs != nullptr && video_jobs->ready();
+  services["image"] = images != nullptr;
+  services["tts"] = tts != nullptr && tts->ready();
+  services["asr"] = asr != nullptr && asr->ready();
+  server["services"] = std::move(services);
+  server["uptime_s"] = static_cast<unsigned long long>(snapshot.uptime_s);
+  server["active_requests"] =
+      static_cast<unsigned long long>(dashboard::Recorder().active_count());
+  server["total_requests"] =
+      static_cast<unsigned long long>(dashboard::Recorder().total_requests());
+  server["total_prompt_tokens"] = static_cast<unsigned long long>(
+      detail::TotalPromptTokens().load(std::memory_order_relaxed));
+  server["total_generated_tokens"] = static_cast<unsigned long long>(
+      detail::TotalGenTokens().load(std::memory_order_relaxed));
+  // In-flight generations with live stage counters: the prompt bar advances on
+  // `prefill_tokens` of `prefill_total`, and decoding on `generated_tokens`.
+  json::Value active = json::Value::array();
+  if (backend != nullptr) {
+    for (const auto& generation : backend->active_generations()) {
+      json::Value entry = json::Value::object();
+      entry["client"] = generation.client;
+      entry["phase"] = generation.phase;
+      entry["prompt_tokens"] =
+          static_cast<unsigned long long>(generation.prompt_tokens);
+      entry["cached_prompt_tokens"] =
+          static_cast<unsigned long long>(generation.cached_prompt_tokens);
+      entry["prefill_tokens"] =
+          static_cast<unsigned long long>(generation.prefill_tokens);
+      entry["prefill_total"] = static_cast<unsigned long long>(
+          generation.prompt_tokens > generation.cached_prompt_tokens
+              ? generation.prompt_tokens - generation.cached_prompt_tokens
+              : 0);
+      entry["generated_tokens"] =
+          static_cast<unsigned long long>(generation.generated_tokens);
+      entry["elapsed_ms"] = generation.elapsed_ms;
+      active.push_back(std::move(entry));
+    }
+  }
+  server["active"] = std::move(active);
+  body["server"] = std::move(server);
+
+  json::Value hardware = json::Value::object();
+  hardware["platform"] = snapshot.platform;
+  json::Value cpu = json::Value::object();
+  cpu["model"] = snapshot.cpu_model.empty() ? json::Value()
+                                            : json::Value(snapshot.cpu_model);
+  cpu["logical_threads"] =
+      snapshot.cpu_threads > 0
+          ? json::Value(static_cast<unsigned long long>(snapshot.cpu_threads))
+          : json::Value();
+  cpu["pct"] = NumberOrNull(snapshot.cpu_pct);
+  hardware["cpu"] = std::move(cpu);
+  hardware["ram_used_bytes"] = CountOrNull(snapshot.ram_used_bytes);
+  hardware["ram_total_bytes"] = CountOrNull(snapshot.ram_total_bytes);
+  hardware["process_rss_bytes"] = CountOrNull(snapshot.process_rss_bytes);
+  if (snapshot.gpu.any()) {
+    json::Value gpu = json::Value::object();
+    gpu["name"] = snapshot.gpu.name.has_value()
+                      ? json::Value(*snapshot.gpu.name)
+                      : json::Value();
+    gpu["util_pct"] = NumberOrNull(snapshot.gpu.util_pct);
+    gpu["vram_used_bytes"] = CountOrNull(snapshot.gpu.vram_used_bytes);
+    gpu["vram_total_bytes"] = CountOrNull(snapshot.gpu.vram_total_bytes);
+    gpu["vram_sysfs_used_bytes"] =
+        CountOrNull(snapshot.gpu.vram_sysfs_used_bytes);
+    gpu["vram_sysfs_total_bytes"] =
+        CountOrNull(snapshot.gpu.vram_sysfs_total_bytes);
+    gpu["power_w"] = NumberOrNull(snapshot.gpu.power_w);
+    hardware["gpu"] = std::move(gpu);
+  } else {
+    hardware["gpu"] = json::Value();
+  }
+  body["hardware"] = std::move(hardware);
+
+  json::Value throughput = json::Value::object();
+  throughput["gen_tps"] = NumberOrNull(snapshot.gen_tps);
+  throughput["prompt_tps"] = NumberOrNull(snapshot.prompt_tps);
+  throughput["last_prompt_tps"] =
+      detail::LastPromptSpeed().load(std::memory_order_relaxed);
+  throughput["last_decode_tps"] =
+      detail::LastGenSpeed().load(std::memory_order_relaxed);
+  body["throughput"] = std::move(throughput);
+
+  // Per-client (session) totals since the server started, keyed by the same
+  // transport peer address the request list shows.
+  json::Value clients = json::Value::array();
+  for (const auto& client : dashboard::Recorder().clients()) {
+    json::Value entry = json::Value::object();
+    entry["client"] = client.client;
+    entry["requests"] = static_cast<unsigned long long>(client.requests);
+    entry["active"] = static_cast<unsigned long long>(client.active);
+    entry["generations"] = static_cast<unsigned long long>(client.generations);
+    entry["prompt_tokens"] =
+        static_cast<unsigned long long>(client.prompt_tokens);
+    entry["completion_tokens"] =
+        static_cast<unsigned long long>(client.completion_tokens);
+    entry["cached_prompt_tokens"] =
+        static_cast<unsigned long long>(client.cached_prompt_tokens);
+    entry["prefill_tokens"] =
+        static_cast<unsigned long long>(client.prefill_tokens);
+    entry["draft_proposed"] =
+        static_cast<unsigned long long>(client.draft_proposed);
+    entry["draft_accepted"] =
+        static_cast<unsigned long long>(client.draft_accepted);
+    entry["prefill_ms"] = client.prefill_ms;
+    entry["decode_ms"] = client.decode_ms;
+    entry["prompt_tps"] =
+        client.prefill_ms > 0.0
+            ? json::Value(1000.0 * static_cast<double>(client.prefill_tokens) /
+                          client.prefill_ms)
+            : json::Value();
+    entry["gen_tps"] =
+        client.decode_ms > 0.0
+            ? json::Value(1000.0 *
+                          static_cast<double>(client.completion_tokens) /
+                          client.decode_ms)
+            : json::Value();
+    entry["last_seen"] = client.last_seen;
+    entry["last_method"] = client.last_method;
+    entry["last_path"] = client.last_path;
+    clients.push_back(std::move(entry));
+  }
+  body["clients"] = std::move(clients);
+
+  json::Value history = json::Value::object();
+  json::Value t = json::Value::array();
+  json::Value cpu_series = json::Value::array();
+  json::Value ram_series = json::Value::array();
+  json::Value gpu_series = json::Value::array();
+  json::Value gpu_power_series = json::Value::array();
+  json::Value vram_series = json::Value::array();
+  json::Value gen_series = json::Value::array();
+  json::Value prompt_series = json::Value::array();
+  for (const auto& sample : snapshot.history) {
+    t.push_back(json::Value(sample.t));
+    cpu_series.push_back(NumberOrNull(sample.cpu_pct));
+    ram_series.push_back(CountOrNull(sample.ram_used_bytes));
+    gpu_series.push_back(NumberOrNull(sample.gpu_util_pct));
+    gpu_power_series.push_back(NumberOrNull(sample.gpu_power_w));
+    vram_series.push_back(CountOrNull(sample.vram_used_bytes));
+    gen_series.push_back(NumberOrNull(sample.gen_tps));
+    prompt_series.push_back(NumberOrNull(sample.prompt_tps));
+  }
+  history["t"] = std::move(t);
+  history["cpu"] = std::move(cpu_series);
+  history["ram_used"] = std::move(ram_series);
+  history["gpu_util"] = std::move(gpu_series);
+  history["gpu_power"] = std::move(gpu_power_series);
+  history["vram_used"] = std::move(vram_series);
+  history["gen_tps"] = std::move(gen_series);
+  history["prompt_tps"] = std::move(prompt_series);
+  body["history"] = std::move(history);
+  return body;
+}
+
+json::Value DashboardRequestsJson() {
+  json::Value body = json::Value::object();
+  json::Value requests = json::Value::array();
+  for (const auto& record : dashboard::Recorder().list()) {
+    json::Value entry = json::Value::object();
+    entry["id"] = record.id;
+    entry["method"] = record.method;
+    entry["path"] = record.path;
+    entry["client"] = record.client;
+    entry["started_at"] = record.started_at;
+    entry["duration_ms"] = record.duration_ms;
+    entry["status"] = record.status;
+    entry["outcome"] = record.outcome;
+    entry["stream"] = record.stream;
+    entry["prompt_tokens"] =
+        record.generation
+            ? json::Value(static_cast<unsigned long long>(record.prompt_tokens))
+            : json::Value();
+    entry["completion_tokens"] =
+        record.generation ? json::Value(static_cast<unsigned long long>(
+                                record.completion_tokens))
+                          : json::Value();
+    entry["cached_prompt_tokens"] =
+        record.generation ? json::Value(static_cast<unsigned long long>(
+                                record.cached_prompt_tokens))
+                          : json::Value();
+    entry["ttft_ms"] =
+        record.generation ? json::Value(record.ttft_ms) : json::Value();
+    entry["queue_ms"] =
+        record.generation ? json::Value(record.queue_ms) : json::Value();
+    entry["prefill_ms"] =
+        record.generation ? json::Value(record.prefill_ms) : json::Value();
+    entry["decode_ms"] =
+        record.generation ? json::Value(record.decode_ms) : json::Value();
+    entry["prompt_tps"] =
+        record.generation ? json::Value(record.prompt_tps) : json::Value();
+    entry["gen_tps"] =
+        record.generation ? json::Value(record.gen_tps) : json::Value();
+    entry["finish"] =
+        record.generation ? json::Value(record.finish) : json::Value();
+    entry["cache"] =
+        record.generation ? json::Value(record.cache) : json::Value();
+    entry["queue_depth"] =
+        record.generation
+            ? json::Value(static_cast<unsigned long long>(record.queue_depth))
+            : json::Value();
+    entry["plan"] =
+        record.generation ? json::Value(record.plan) : json::Value();
+    entry["draft_proposed"] = record.generation
+                                  ? json::Value(static_cast<unsigned long long>(
+                                        record.draft_proposed))
+                                  : json::Value();
+    entry["draft_accepted"] = record.generation
+                                  ? json::Value(static_cast<unsigned long long>(
+                                        record.draft_accepted))
+                                  : json::Value();
+    requests.push_back(std::move(entry));
+  }
+  body["requests"] = std::move(requests);
+  return body;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1297,9 @@ HttpServer::HttpServer(std::string host, int port,
   if (!options_.api_key.empty()) {
     api_key_hash_ = CredentialHash(options_.api_key);
   }
+  telemetry_ =
+      std::make_unique<dashboard::TelemetrySampler>(backend_ != nullptr);
+  telemetry_->start();
   register_routes();
 }
 
@@ -1214,6 +1515,9 @@ void HttpServer::run(bool handle_signals) {
 }
 
 void HttpServer::stop() {
+  if (telemetry_ != nullptr) {
+    telemetry_->stop();
+  }
   const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
   if (!was_stopped && listen_fd_ >= 0) {
     // Keep the descriptor owned until destruction: run() may still be inside
@@ -1250,6 +1554,16 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
+  // The dashboard page carries no secrets, so browsers can load it before
+  // they have an API key; its JSON endpoints stay behind the bearer gate.
+  if (req.method == "GET" &&
+      (req.path == "/dashboard" || req.path == "/dashboard/")) {
+    return HttpResponse{
+        .body = std::string(reinterpret_cast<const char*>(kDashboardHtml),
+                            kDashboardHtmlSize),
+        .headers = {{"Content-Type", "text/html; charset=utf-8"},
+                    {"Cache-Control", "no-store"}}};
+  }
   if (!IsAuthorized(req, api_key_hash_)) {
     auto response = Err(401, "Unauthorized", "missing or invalid API key",
                         "authentication_error", "invalid_api_key");
@@ -1295,6 +1609,14 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
                       images_.get());
+  }
+  if (req.method == "GET" && req.path == "/dashboard/status") {
+    const dashboard::TelemetrySnapshot snapshot = telemetry_->snapshot();
+    return Ok(DashboardStatusJson(snapshot, backend_.get(), video_jobs_.get(),
+                                  tts_.get(), asr_.get(), images_.get()));
+  }
+  if (req.method == "GET" && req.path == "/dashboard/requests") {
+    return Ok(DashboardRequestsJson());
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
@@ -1482,6 +1804,8 @@ void HttpServer::handle_connection(int client_fd) {
         req.method == "POST" || req.method == "DELETE" ||
         req.path == "/v1/models" || req.path.ends_with("/content") ||
         req.path == "/v1/realtime" || req.path == "/v1/audio/speech/stream";
+    dashboard::Recorder().begin(req.request_id, req.method, req.path,
+                                req.client_id, log_request);
     if (ok && log_request) {
       Logger::Info("http", "request=" + req.request_id +
                                " event=received method=" + req.method +
@@ -1558,6 +1882,13 @@ void HttpServer::handle_connection(int client_fd) {
       Logger::LogRequest(req.request_id, req.method, req.path, resp.status,
                          elapsed_ms(), resp.log_details, outcome);
     }
+    // The dashboard list is the in-memory twin of the request log: it is
+    // committed under the same predicate and never sees dashboard polling.
+    dashboard::Recorder().finish(
+        resp.status, elapsed_ms(), outcome,
+        static_cast<bool>(resp.streaming_body) ||
+            static_cast<bool>(resp.websocket),
+        log_request || resp.status >= 400 || !connected);
   } catch (const TextGenerationError& exception) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -1579,6 +1910,9 @@ void HttpServer::handle_connection(int client_fd) {
                        duration_ms,
                        std::string("error_code=") + exception.stable_code(),
                        response_started ? "stream_error" : "failed");
+    dashboard::Recorder().finish(
+        response_started ? response_status : resp.status, duration_ms,
+        response_started ? "stream_error" : "failed", response_started, true);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
   } catch (const std::exception& e) {
@@ -1592,6 +1926,9 @@ void HttpServer::handle_connection(int client_fd) {
                        response_started ? response_status : resp.status,
                        duration_ms, "error_code=server_exception",
                        response_started ? "stream_error" : "failed");
+    dashboard::Recorder().finish(
+        response_started ? response_status : resp.status, duration_ms,
+        response_started ? "stream_error" : "failed", response_started, true);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
   } catch (...) {
@@ -1606,6 +1943,9 @@ void HttpServer::handle_connection(int client_fd) {
                        response_started ? response_status : resp.status,
                        duration_ms, "error_code=server_exception",
                        response_started ? "stream_error" : "failed");
+    dashboard::Recorder().finish(
+        response_started ? response_status : resp.status, duration_ms,
+        response_started ? "stream_error" : "failed", response_started, true);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
   }

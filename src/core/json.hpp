@@ -93,6 +93,13 @@ public:
     }
     return nullptr;
   }
+  /// Member `key` as a reference for read-only traversal; a shared null value
+  /// when absent, so `v.at("a").at("b")` never dereferences null.
+  const Value& at(const std::string& key) const noexcept {
+    static const Value kNull;
+    const Value* found = find(key);
+    return found != nullptr ? *found : kNull;
+  }
   bool contains(const std::string& key) const noexcept {
     return find(key) != nullptr;
   }

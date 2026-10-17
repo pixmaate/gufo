@@ -37,6 +37,16 @@ std::uint32_t ParseUint(std::string_view str) {
 
 }  // namespace
 
+namespace {
+#ifdef _WIN32
+// The constructor absolutizes the roots, so on Windows the default "/proc"
+// becomes "<drive>:\proc"; match the default root in that form.
+bool IsDefaultProcRoot(const std::filesystem::path& proc_root) {
+  return proc_root == std::filesystem::absolute("/proc");
+}
+#endif
+}  // namespace
+
 LinuxSysfs::LinuxSysfs(const std::filesystem::path& sys_root,
                        const std::filesystem::path& proc_root)
     : sys_root_(std::filesystem::absolute(sys_root)),
@@ -105,7 +115,7 @@ std::optional<HostCpuInfo> LinuxSysfs::QueryCpuInfo() const {
   const auto content_opt = ReadFile(proc_root_ / "cpuinfo");
   if (!content_opt) {
 #ifdef _WIN32
-    if (proc_root_ == "/proc")
+    if (IsDefaultProcRoot(proc_root_))
       return WindowsCpuInfo();
 #endif
     return std::nullopt;
@@ -156,7 +166,7 @@ std::optional<HostMemInfo> LinuxSysfs::QueryMemInfo() const {
   const auto content_opt = ReadFile(proc_root_ / "meminfo");
   if (!content_opt) {
 #ifdef _WIN32
-    if (proc_root_ == "/proc") {
+    if (IsDefaultProcRoot(proc_root_)) {
       HostMemInfo windows;
       windows.total_bytes = gufo_total_physical_bytes();
       windows.available_bytes = gufo_available_physical_bytes();

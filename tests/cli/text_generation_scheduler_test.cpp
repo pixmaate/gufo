@@ -38,6 +38,7 @@ using gufo::server::TextPrefillPolicy;
 using gufo::server::TextPrefillStep;
 using gufo::server::TextRequestMetadata;
 using gufo::server::TextRequestPhase;
+using gufo::server::TextRequestProgress;
 using gufo::server::TextRunnerAdvance;
 using gufo::server::TextRunnerCapabilities;
 using gufo::server::TextRunnerDescriptor;
@@ -563,6 +564,70 @@ void TestIdlePrefillUsesBulkWorkUnit() {
              result.physical_execution_width == 1 &&
              result.execution_plan == "serial-c1",
          "C=1 telemetry reports immediate serial dispatch");
+}
+
+const TextRequestProgress* FindProgress(
+    const std::vector<TextRequestProgress>& snapshot, std::uint64_t id) {
+  for (const auto& entry : snapshot) {
+    if (entry.id == id) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+void TestProgressSnapshotReportsLiveStageCounters() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {.decode_active_tokens = 2});
+
+  auto working = scheduler->Submit({1, 10, 11}, 1, 0.0F, {}, false,
+                                   ClientMetadata("10.0.0.9"));
+  control->WaitForPrefill(1);
+  auto waiting = scheduler->Submit({2, 20}, 1, 0.0F, {}, false,
+                                   ClientMetadata("10.0.0.7"));
+
+  const auto mid_prefill = scheduler->progress();
+  Expect(mid_prefill.size() == 2,
+         "queued and resident requests both appear in progress snapshots");
+  const auto* active = FindProgress(mid_prefill, working.id());
+  const auto* pending = FindProgress(mid_prefill, waiting.id());
+  Expect(active != nullptr && active->client_id == "10.0.0.9",
+         "progress reports the transport client identity");
+  Expect(active != nullptr && active->phase == TextRequestPhase::kPrefilling &&
+             active->prompt_tokens == 3 && active->cached_prompt_tokens == 0 &&
+             active->prefill_tokens == 0,
+         "prefill progress is published while the first chunk is running");
+  Expect(pending != nullptr && pending->phase == TextRequestPhase::kQueued &&
+             pending->prompt_tokens == 2,
+         "queued requests report their prompt size and queue phase");
+  Expect(active != nullptr && active->elapsed_ms >= 0.0 &&
+             active->generated_tokens == 0,
+         "progress reports elapsed time and no tokens before decoding");
+  control->ReleasePrefill();
+
+  const auto first = working.Wait();
+  Expect(first.tokens.size() == 1, "the blocked request still completes");
+
+  // The fake runner blocks inside the first advance, after that token was
+  // published, so the live counter is observed mid-decode instead of racing
+  // the request to completion and out of the progress registry.
+  control->block_advance_label = 3;
+  auto streaming = scheduler->Submit({3, 30}, 8, 0.0F, {}, true);
+  const std::uint64_t streaming_id = streaming.id();
+  control->WaitForAdvance(3);
+  const auto inflight = scheduler->progress();
+  const auto* decoding = FindProgress(inflight, streaming_id);
+  Expect(decoding != nullptr &&
+             decoding->phase == TextRequestPhase::kDecoding &&
+             decoding->generated_tokens == 1,
+         "generated tokens are published while the request decodes");
+  control->ReleaseAdvance();
+
+  const auto streamed = streaming.Wait();
+  Expect(streamed.tokens.size() == 8, "the streaming request completes");
+  Expect(scheduler->progress().empty(),
+         "finished requests leave the progress registry");
 }
 
 void TestRunnerCanSkipUnusedFinalAdvance() {
@@ -1579,6 +1644,7 @@ int main() {
   TestSnapshotDoesNotBlockOtherRequests();
   TestFirstTokenPrecedesSnapshotAndPreservesBudget();
   TestIdlePrefillUsesBulkWorkUnit();
+  TestProgressSnapshotReportsLiveStageCounters();
   TestRunnerCanSkipUnusedFinalAdvance();
   TestRunnerCanReuseExactIncrementalText();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();

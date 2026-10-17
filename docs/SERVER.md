@@ -284,6 +284,44 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
 | `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
 
+### Dashboard
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/dashboard` | Self-contained monitoring page (HTML) |
+| `GET` | `/dashboard/status` | Telemetry snapshot and server configuration |
+| `GET` | `/dashboard/requests` | Metadata-only log of recent requests |
+
+`GET /dashboard` serves a single embedded page (no external assets) with
+Overview, Chat and Models tabs. The page polls the two dashboard endpoints
+every 2 seconds and renders status, hardware and per-request telemetry,
+including live per-request progress bars and a per-client token table; the
+Chat tab talks to the standard Chat Completions endpoint with SSE streaming.
+The page itself is served without authentication so a browser can load it;
+the data endpoints are Bearer-gated like every other endpoint when
+`--api-key` is set, and the page prompts for the key. Unlike `/metrics`, the
+dashboard endpoints answer for every service mode, not only text serving.
+
+`/dashboard/status` reports the loaded model, readiness, context/sessions/
+speculative config, sampling and reasoning defaults, uptime, request counts,
+rolling prompt/decode throughput, and a 60-sample 1 Hz history of CPU, RAM,
+GPU utilization, VRAM, GPU power and prompt/decode token rates.
+`hardware.gpu.power_w` is the board power published by the amdgpu hwmon
+interface on Linux. While requests are in flight it also carries a
+`server.active` array
+with each generation's phase (queued, prefill, decoding), prompt/cached/
+prefill/generated token counts and elapsed time, so progress can be shown
+live before the request finishes. A top-level `clients` array aggregates
+totals per client address: requests, generations, prompt, completion and
+cached tokens, prompt/decode throughput, draft acceptance, active count and
+last-seen activity. Unavailable readings are `null`, never guessed; on
+Windows GPU utilization includes display-engine activity and GPU power is
+null (no public user-mode API exposes it). `/dashboard/requests` lists the
+last 100 finished requests newest first with status, token counts, TTFT,
+duration, cache hits, draft acceptance and queue state. The recorder keeps
+metadata only: no prompt text, model paths, machine identity or token ids
+are stored.
+
 ### Other model services
 
 | Method | Path | Condition |
@@ -709,6 +747,9 @@ lazily in the worker. Control characters are escaped in log lines.
 - `json_test`: number precision, Unicode escapes, malformed input and depth limits.
 - `http_server_test`: transport framing, authentication, compatibility validation,
   sampling forwarding, request logs and streaming failures without loading a model.
+- `dashboard_test`: request-recorder metadata bookkeeping, ring-buffer cap,
+  per-client token totals, dashboard HTTP routes, embedded page invariants and
+  telemetry sampler sanity without loading a model.
 - `openai_chat_test`: chat parsing, streaming, images, tools and sampling controls.
 - `serve_cli_test`: executable help, argument wiring and rejected configurations.
 - Per-model serving tests: greedy/sampled decoding, batching, cache reuse and

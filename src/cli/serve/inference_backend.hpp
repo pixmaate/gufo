@@ -122,6 +122,9 @@ public:
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   [[nodiscard]] std::uint32_t max_context() const;
+  [[nodiscard]] ModelInfo model_info() const override;
+  [[nodiscard]] std::vector<ActiveGeneration> active_generations()
+      const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
