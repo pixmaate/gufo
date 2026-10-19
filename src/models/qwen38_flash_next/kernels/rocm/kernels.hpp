@@ -95,7 +95,7 @@ std::uint32_t HcInjectPartsVec4(std::uint32_t hidden);
 void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                    float* mixed, float* inject, std::uint32_t n_tokens,
                    std::uint32_t hidden, std::uint32_t streams,
-                   hipStream_t stream);
+                   hipStream_t stream, void* mixed_q8 = nullptr);
 /// Four adjacent hidden lanes per thread. The model's four-stream geometry
 /// emits HcInjectPartsVec4(hidden) partial sums per inject logit.
 void HcMixEpilogueVec4(const float* xn, const float* gate,

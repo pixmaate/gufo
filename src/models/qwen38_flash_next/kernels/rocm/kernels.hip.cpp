@@ -228,96 +228,59 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
 /// the thread. With `inject_w` every block also contributes its slice of the
 /// inject dot products, written as partial sums [t][stream][chunk] that
 /// HcCombine totals (a fixed-order reduction, so the result is stable).
+/// `kStreams` fixes the stream count (0: the `streams` argument, up to 8) so
+/// the stream loops unroll: every read is issued up front, the inject
+/// weights before the `mixed` store, and the sums still run stream by
+/// stream in order.
+template<std::uint32_t kStreams>
 __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
                                     const float* inject_w, float* mixed,
                                     float* inject, std::uint32_t hidden,
-                                    std::uint32_t streams) {
+                                    std::uint32_t streams, void* mixed_q8) {
   constexpr std::uint32_t kMaxStreams = 8;
+  constexpr std::uint32_t kSlots = kStreams != 0 ? kStreams : kMaxStreams;
+  if constexpr (kStreams != 0) {
+    streams = kStreams;
+  }
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(streams) * hidden;
   const float* x = xn + static_cast<std::size_t>(t) * hc_dim;
-  if (streams == 4) {
-    // Decode's inputs are cold (the GEMVs before evicted them): issue every
-    // load, inject weights included, before the first store. Same float
-    // operations in the same order as the loop below.
-    constexpr std::uint32_t kS = 4;
-    float v4[kS];
-    float g4[kS];
-    float w4[kS][kS];
+  const float* g = gate + static_cast<std::size_t>(t) * hc_dim;
+  const bool live = i < hidden;
+  float v[kSlots];
+  float gv[kSlots];
 #pragma unroll
-    for (std::uint32_t s = 0; s < kS; ++s) {
-      const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
-      v4[s] = i < hidden ? x[idx] : 0.0f;
-      g4[s] = i < hidden ? gate[static_cast<std::size_t>(t) * hc_dim + idx]
-                         : 0.0f;
-    }
-    if (inject_w != nullptr) {
-#pragma unroll
-      for (std::uint32_t o = 0; o < kS; ++o) {
-#pragma unroll
-        for (std::uint32_t s = 0; s < kS; ++s) {
-          w4[o][s] = i < hidden ? inject_w[o * hc_dim +
-                                           static_cast<std::size_t>(s) * hidden +
-                                           i]
-                                : 0.0f;
-        }
-      }
-    }
-    float acc4 = 0.0f;
-#pragma unroll
-    for (std::uint32_t s = 0; s < kS; ++s) {
-      if (i < hidden) {
-        acc4 += v4[s] * SigmoidF(g4[s]);
-      }
-    }
-    if (i < hidden) {
-      mixed[static_cast<std::size_t>(t) * hidden + i] =
-          acc4 / static_cast<float>(streams);
-    }
-    if (inject_w == nullptr) {
-      return;
-    }
-    __shared__ float partial4[kS][kThreads / 32];
-    const std::uint32_t lane4 = threadIdx.x % warpSize;
-    const std::uint32_t wave4 = threadIdx.x / warpSize;
-#pragma unroll
-    for (std::uint32_t o = 0; o < kS; ++o) {
-      float dot = 0.0f;
-      if (i < hidden) {
-#pragma unroll
-        for (std::uint32_t s = 0; s < kS; ++s) {
-          dot += w4[o][s] * v4[s];
-        }
-      }
-      dot = WaveSum(dot);
-      if (lane4 == 0) {
-        partial4[o][wave4] = dot;
-      }
-    }
-    __syncthreads();
-    if (threadIdx.x < kS) {
-      float total = 0.0f;
-      for (std::uint32_t w = 0; w < blockDim.x / warpSize; ++w) {
-        total += partial4[threadIdx.x][w];
-      }
-      inject[(static_cast<std::size_t>(t) * kS + threadIdx.x) * gridDim.y +
-             blockIdx.y] = total;
-    }
-    return;
-  }
-  float v[kMaxStreams];
-  float acc = 0.0f;
-  for (std::uint32_t s = 0; s < streams; ++s) {
+  for (std::uint32_t s = 0; s < kSlots; ++s) {
     const std::size_t idx = static_cast<std::size_t>(s) * hidden + i;
-    v[s] = i < hidden ? x[idx] : 0.0f;
-    if (i < hidden) {
-      acc += v[s] * SigmoidF(gate[static_cast<std::size_t>(t) * hc_dim + idx]);
+    v[s] = live && s < streams ? x[idx] : 0.0f;
+    gv[s] = live && s < streams ? g[idx] : 0.0f;
+  }
+  float wv[kSlots][kSlots];
+#pragma unroll
+  for (std::uint32_t o = 0; o < kSlots; ++o) {
+#pragma unroll
+    for (std::uint32_t s = 0; s < kSlots; ++s) {
+      wv[o][s] =
+          inject_w != nullptr && live && o < streams && s < streams
+              ? inject_w[o * hc_dim + static_cast<std::size_t>(s) * hidden + i]
+              : 0.0f;
     }
   }
-  if (i < hidden) {
-    mixed[static_cast<std::size_t>(t) * hidden + i] =
-        acc / static_cast<float>(streams);
+  float acc = 0.0f;
+#pragma unroll
+  for (std::uint32_t s = 0; s < kSlots; ++s) {
+    if (live && s < streams) {
+      acc = Materialize(acc + v[s] * SigmoidF(gv[s]));
+    }
+  }
+  if (live) {
+    const float out = acc / static_cast<float>(streams);
+    mixed[static_cast<std::size_t>(t) * hidden + i] = out;
+    // hidden % 32 == 0, so whole 32-lane groups take this branch together.
+    if (mixed_q8 != nullptr) {
+      QuantizeQ8_1Lane(out, mixed_q8, static_cast<std::size_t>(t) * hidden + i);
+    }
   }
   if (inject_w == nullptr) {
     return;
@@ -327,12 +290,18 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
   __shared__ float partial[kMaxStreams][kThreads / 32];
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t wave = threadIdx.x / warpSize;
-  for (std::uint32_t o = 0; o < streams; ++o) {
-    const float* w = inject_w + o * hc_dim;
+#pragma unroll
+  for (std::uint32_t o = 0; o < kSlots; ++o) {
+    if (o >= streams) {
+      break;
+    }
     float dot = 0.0f;
-    if (i < hidden) {
-      for (std::uint32_t s = 0; s < streams; ++s) {
-        dot += w[static_cast<std::size_t>(s) * hidden + i] * v[s];
+    if (live) {
+#pragma unroll
+      for (std::uint32_t s = 0; s < kSlots; ++s) {
+        if (s < streams) {
+          dot = Materialize(dot + wv[o][s] * v[s]);
+        }
       }
     }
     dot = WaveSum(dot);
@@ -1068,7 +1037,8 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 /// once (four consecutive elements per lane per step) while up to eight
 /// tokens accumulate in registers, then a wave reduction per token.
 constexpr unsigned kSmallGemmRows = 4;
-template<WeightType type, unsigned tokens, bool grouped = false>
+template<WeightType type, unsigned tokens, bool grouped = false,
+         bool kWhole = false>
 __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
                                 std::uint32_t m, std::uint32_t k) {
   if constexpr (grouped) {
@@ -1083,22 +1053,68 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   }
   const auto* wrow =
       static_cast<const std::uint8_t*>(w) + RowBytes(type, k) * row;
+  // A lane's steps are loaded kSteps at a time so their reads overlap (one
+  // step at a time leaves a decode-sized projection latency-bound); the
+  // steps still accumulate one after another, in order.
+  constexpr unsigned kSteps = kWhole || tokens <= 2 ? 4 : 2;
+  const std::uint32_t stride = warpSize * 4;
   float acc[tokens] = {};
-  for (std::uint32_t i0 = lane * 4; i0 < k; i0 += warpSize * 4) {
-    float wv[4];
+  for (std::uint32_t i_base = lane * 4; i_base < k; i_base += stride * kSteps) {
+    float wv[kSteps][4];
+    float xv[kSteps][tokens][4];
 #pragma unroll
-    for (unsigned r = 0; r < 4; ++r) {
-      wv[r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
-    }
+    for (unsigned st = 0; st < kSteps; ++st) {
+      const std::uint32_t i0 = i_base + st * stride;
+      if constexpr (kWhole) {
+        // F32 rows of whole passes (k a multiple of stride * kSteps): every
+        // step is in range, so the four elements arrive as one 16-byte load.
+        const float4 w4 = reinterpret_cast<const float4*>(
+            static_cast<const void*>(wrow))[i0 / 4];
+        wv[st][0] = w4.x;
+        wv[st][1] = w4.y;
+        wv[st][2] = w4.z;
+        wv[st][3] = w4.w;
 #pragma unroll
-    for (unsigned j = 0; j < tokens; ++j) {
-      const float* xr = x + static_cast<std::size_t>(j) * k + i0;
-      float dot = 0.0f;
+        for (unsigned j = 0; j < tokens; ++j) {
+          const float4 x4 = reinterpret_cast<const float4*>(
+              x + static_cast<std::size_t>(j) * k)[i0 / 4];
+          xv[st][j][0] = x4.x;
+          xv[st][j][1] = x4.y;
+          xv[st][j][2] = x4.z;
+          xv[st][j][3] = x4.w;
+        }
+        continue;
+      }
 #pragma unroll
       for (unsigned r = 0; r < 4; ++r) {
-        dot += wv[r] * (i0 + r < k ? xr[r] : 0.0f);
+        wv[st][r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
       }
-      acc[j] += dot;
+#pragma unroll
+      for (unsigned j = 0; j < tokens; ++j) {
+        const float* xr = x + static_cast<std::size_t>(j) * k + i0;
+#pragma unroll
+        for (unsigned r = 0; r < 4; ++r) {
+          xv[st][j][r] = i0 + r < k ? xr[r] : 0.0f;
+        }
+      }
+    }
+#pragma unroll
+    for (unsigned st = 0; st < kSteps; ++st) {
+      const std::uint32_t i0 = i_base + st * stride;
+      if (!kWhole && i0 >= k) {
+        break;
+      }
+#pragma unroll
+      for (unsigned j = 0; j < tokens; ++j) {
+        // Four products per step, then added to acc: the exact grouping of
+        // the one-step loop, so the sum stays bit for bit the same.
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < 4; ++r) {
+          dot += wv[st][r] * xv[st][j][r];
+        }
+        acc[j] = Materialize(acc[j] + dot);
+      }
     }
   }
 #pragma unroll
@@ -4502,8 +4518,9 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
                  float eps, hipStream_t stream) {
   // Every (row, group) pair is one block; the kernel recovers the group
   // from the block index to pick its gamma slice.
+  const std::uint32_t group_dim = dim / groups;
   hipLaunchKernelGGL(RmsNormKernel, dim3(n_rows * groups), dim3(kThreads), 0,
-                     stream, x, gamma, out, dim / groups, groups, eps);
+                     stream, x, gamma, out, group_dim, groups, eps);
 }
 
 std::uint32_t HcInjectParts(std::uint32_t hidden) {
@@ -4517,10 +4534,19 @@ std::uint32_t HcInjectPartsVec4(std::uint32_t hidden) {
 void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                    float* mixed, float* inject, std::uint32_t n_tokens,
                    std::uint32_t hidden, std::uint32_t streams,
-                   hipStream_t stream) {
-  hipLaunchKernelGGL(HcMixEpilogueKernel, dim3(n_tokens, Blocks(hidden)),
+                   hipStream_t stream, void* mixed_q8) {
+  if (hidden % 32 != 0) {
+    mixed_q8 = nullptr;
+  }
+  if (streams == 4) {
+    hipLaunchKernelGGL(HcMixEpilogueKernel<4>, dim3(n_tokens, Blocks(hidden)),
+                       dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
+                       inject, hidden, streams, mixed_q8);
+    return;
+  }
+  hipLaunchKernelGGL(HcMixEpilogueKernel<0>, dim3(n_tokens, Blocks(hidden)),
                      dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
-                     inject, hidden, streams);
+                     inject, hidden, streams, mixed_q8);
 }
 
 void HcMixEpilogueVec4(const float* xn, const float* gate,
@@ -5602,6 +5628,21 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
 template<WeightType type, unsigned tokens>
 void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                      std::uint32_t k, hipStream_t stream) {
+  if constexpr (type == WeightType::kF32) {
+    // Rows of whole four-step passes (K 2560: router, GDN alpha/beta,
+    // indexer) take the unchecked 16-byte loads, four steps at a time at
+    // any width: the same products in the same order.
+    const bool aligned = (reinterpret_cast<std::uintptr_t>(w) |
+                          reinterpret_cast<std::uintptr_t>(x)) %
+                             16 ==
+                         0;
+    if (aligned && k % (32 * 4 * 4) == 0) {
+      hipLaunchKernelGGL((SmallGemmKernel<type, tokens, false, true>),
+                         dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+                         dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+      return;
+    }
+  }
   hipLaunchKernelGGL((SmallGemmKernel<type, tokens>),
                      dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
                      dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
