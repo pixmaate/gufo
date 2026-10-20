@@ -542,13 +542,14 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
 /// grouped norm of the next mixer reduces over exactly its own elements.
 /// `XnT` is float for the reference route and __half for the F16 mixer
 /// input route; a non-null `xn_q8` also receives the norm quantized into
-/// the tiled Q8 layout (hidden % 32 == 0) for the W8A8 down projection.
+/// the tiled Q8 layout (hidden % 32 == 0) for the W8A8 down projection, and
+/// a non-null `xn_q8_1` receives its unpadded Q8_1 rows.
 template<typename XnT>
 __global__ void HcCombineKernel(float* res, const float* block_out,
                                 const float* inject, std::uint32_t inject_parts,
                                 const float* gamma, XnT* xn, void* xn_q8,
                                 std::uint32_t hidden, std::uint32_t streams,
-                                float eps) {
+                                float eps, void* xn_q8_1) {
   __shared__ float shared[32];
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t s = blockIdx.y;
@@ -602,7 +603,13 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
     for (std::uint32_t k = 0; k < kMaxPer; ++k) {
       const std::uint32_t i = threadIdx.x + k * blockDim.x;
       if (i < hidden) {
-        xn[base0 + i] = static_cast<XnT>(r[k] * scale0 * gg[k]);
+        const float v = r[k] * scale0 * gg[k];
+        xn[base0 + i] = static_cast<XnT>(v);
+        // hidden and blockDim are multiples of 32: whole 32-lane groups
+        // take this branch together, lane i % 32 holding element i.
+        if (xn_q8_1 != nullptr) {
+          QuantizeQ8_1Lane(v, xn_q8_1, base0 + i);
+        }
       }
     }
     return;
@@ -631,6 +638,9 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
     const float v = dst[i] * scale * g[i];
     xn[base + i] = static_cast<XnT>(v);
+    if (xn_q8_1 != nullptr) {
+      QuantizeQ8_1Lane(v, xn_q8_1, base + i);
+    }
     if (xn_q8 != nullptr) {
       // A wave holds one 32-wide block of the row per iteration: quantize
       // it for the next mixer's W8A8 down projection, K = streams * hidden.
@@ -1022,6 +1032,19 @@ __global__ void SigmoidMulKernel(float* x, const float* g, std::size_t count) {
   if (i < count) {
     x[i] *= SigmoidF(g[i]);
   }
+}
+
+/// SigmoidMulKernel that also writes x's unpadded Q8_1 rows (count % 32 == 0).
+__global__ void SigmoidMulQ8Kernel(float* x, const float* g, std::size_t count,
+                                   void* x_q8) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  const float v = x[i] * SigmoidF(g[i]);
+  x[i] = v;
+  QuantizeQ8_1Lane(v, x_q8, i);
 }
 
 template<typename T>
@@ -1663,14 +1686,15 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
 /// one wave per (token, head) row.
 /// A non-null `out_q8` receives the row quantized into the tiled Q8 layout
 /// of the ssm_out projection (K = v_heads * d) in place of the F32 row:
-/// each wave-wide slice of 32 lanes is one K block.
+/// each wave-wide slice of 32 lanes is one K block. Otherwise a non-null
+/// `out_q8_1` also receives the F32 rows' unpadded Q8_1 rows.
 template<bool kBatch>
 __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t z_stride, const float* norm_w,
                                   float* out, void* out_q8, __half* out_half,
                                   std::uint32_t n_rows, std::uint32_t v_heads,
                                   float eps, const GdnBatchItem* batch,
-                                  std::uint32_t active) {
+                                  std::uint32_t active, void* out_q8_1) {
   if constexpr (kBatch) {
     if ((active & (1U << blockIdx.z)) == 0)
       return;
@@ -1704,10 +1728,13 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
     for (std::uint32_t r = 0; r < per_lane; ++r) {
       const std::uint32_t i = r * warpSize + lane;
       const float value = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
-      if (out_half != nullptr)
+      if (out_half != nullptr) {
         out_half[row * d + i] = __float2half_rn(value);
-      else
+      } else {
         out[row * d + i] = value;
+        if (out_q8_1 != nullptr)
+          QuantizeQ8_1Lane(value, out_q8_1, row * d + i);
+      }
     }
     return;
   }
@@ -4603,7 +4630,22 @@ void HcCombine(float* res, const float* block_out, const float* inject,
   }
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
-                     inject_parts, gamma, xn, nullptr, hidden, streams, eps);
+                     inject_parts, gamma, xn, nullptr, hidden, streams, eps,
+                     nullptr);
+}
+
+bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
+                   std::uint32_t inject_parts, const float* gamma, float* xn,
+                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
+                   std::uint32_t streams, float eps, hipStream_t stream) {
+  if (gamma == nullptr || hidden % 32 != 0) {
+    return false;
+  }
+  hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
+                     dim3(kThreads), 0, stream, res, block_out, inject,
+                     inject_parts, gamma, xn, nullptr, hidden, streams, eps,
+                     xn_q8);
+  return true;
 }
 
 bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
@@ -4637,7 +4679,8 @@ void HcCombineF16(float* res, const float* block_out, const float* inject,
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
-                     inject_parts, gamma, xn, xn_q8, hidden, streams, eps);
+                     inject_parts, gamma, xn, xn_q8, hidden, streams, eps,
+                     nullptr);
 }
 
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream) {
@@ -4672,6 +4715,16 @@ void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream) {
   hipLaunchKernelGGL(SigmoidMulKernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, x, g, count);
+}
+
+bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
+                    hipStream_t stream) {
+  if (count % 32 != 0) {
+    return false;
+  }
+  hipLaunchKernelGGL(SigmoidMulQ8Kernel, dim3(Blocks(count)), dim3(kThreads), 0,
+                     stream, x, g, count, x_q8);
+  return true;
 }
 
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
@@ -5892,7 +5945,7 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t k_heads, std::uint32_t v_heads,
                    std::uint32_t d, std::uint32_t kernel, bool row_split,
                    bool convolved, float eps, hipStream_t stream,
-                   __half* out_half) {
+                   __half* out_half, void* out_q8_1) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&
@@ -5961,7 +6014,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   hipLaunchKernelGGL(
       GdnEpilogueKernel<false>, dim3((n_tokens * v_heads + waves - 1) / waves),
       dim3(kThreads), 0, stream, raw, z, z_stride, norm_w, out, out_q8,
-      out_half, n_tokens * v_heads, v_heads, eps, nullptr, 0);
+      out_half, n_tokens * v_heads, v_heads, eps, nullptr, 0,
+      out_q8 == nullptr && out_half == nullptr ? out_q8_1 : nullptr);
 }
 
 bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
@@ -5993,7 +6047,7 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
                      dim3((max_tokens * v_heads + waves - 1) / waves, 1, count),
                      dim3(kThreads), 0, stream, nullptr, nullptr, z_stride,
                      norm_w, nullptr, nullptr, nullptr, max_tokens * v_heads,
-                     v_heads, eps, items, active);
+                     v_heads, eps, items, active, nullptr);
   return hipGetLastError() == hipSuccess;
 }
 

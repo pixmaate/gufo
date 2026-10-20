@@ -100,6 +100,13 @@ bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
 }
 
+/// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
+/// contiguous element order is the layout.
+bool UnpaddedQ8(std::uint32_t k) {
+  return k % 32 == 0 &&
+         qfn_mmq_q8_1_bytes(1, static_cast<int>(k)) == k / 32 * 36;
+}
+
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
 /// Wide dense Q8_0 projections take the F16 WMMA GEMM (F16 activation
@@ -407,6 +414,15 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                            static_cast<int>(model.max_q8_cols())),
         error_msg);
   }
+  const auto q8_1 = [&](std::size_t k) {
+    return Alloc<std::uint8_t>(
+        a, qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch), static_cast<int>(k)),
+        error_msg);
+  };
+  s.xn_q8_1 = q8_1(hc_dim);
+  s.mixed_q8_1 = q8_1(hidden);
+  s.gdn_q8_1 = q8_1(c.SsmValueDim());
+  s.ctx_q8_1 = q8_1(c.AttentionQDim());
   s.x_q8t =
       Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
   s.res = f32(T * hc_dim);
@@ -835,6 +851,21 @@ int RoutedTileCols(std::uint32_t n_tokens, std::uint32_t n_used,
   return 80;
 }
 
+const void* Executor::ReadyQ8(const float* x, std::uint32_t n_tokens,
+                              std::uint32_t k) const {
+  for (const ReadyRows* r : {&xn_q8_ready_, &mixed_q8_ready_}) {
+    if (r->src != nullptr && r->src == x && r->n == n_tokens && r->k == k) {
+      return r->data;
+    }
+  }
+  return nullptr;
+}
+
+void Executor::DropReadyQ8() const {
+  xn_q8_ready_ = {};
+  mixed_q8_ready_ = {};
+}
+
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                         Q8Input* q, std::string* error_msg) const {
   q->x = x;
@@ -843,6 +874,10 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   q->k = k;
   if (MatrixRows(n_tokens)) {
     return true;  // the tiled path quantizes per call
+  }
+  if (const void* ready = ReadyQ8(x, n_tokens, k)) {
+    q->data = ready;
+    return true;
   }
   // Two slots alternate, so an input stays valid across one other
   // quantization; captured graphs replay the same alternation.
@@ -1182,11 +1217,19 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
        a.type == GgmlType::kQ8_0)) {
-    if (qfn_mmq_moe_gated_vec(
-            static_cast<int>(a.type), a.data, b.data, x, ids, out,
-            static_cast<int>(a.rows), static_cast<int>(a.cols),
-            static_cast<int>(n_tokens), static_cast<int>(a.experts),
-            static_cast<int>(n_used), stream_) != 0) {
+    // The shared expert quantized the same rows (or their producer did).
+    const void* ready = ReadyQ8(x, n_tokens, a.cols);
+    if ((ready != nullptr
+             ? qfn_mmq_moe_gated_vec_preq(
+                   static_cast<int>(a.type), a.data, b.data, ready, ids, out,
+                   static_cast<int>(a.rows), static_cast<int>(a.cols),
+                   static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                   static_cast<int>(n_used), stream_)
+             : qfn_mmq_moe_gated_vec(
+                   static_cast<int>(a.type), a.data, b.data, x, ids, out,
+                   static_cast<int>(a.rows), static_cast<int>(a.cols),
+                   static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                   static_cast<int>(n_used), stream_)) != 0) {
       AssignError(error_msg, "gated expert vector projection failed");
       return false;
     }
@@ -1230,6 +1273,7 @@ void Executor::Combine(float* res, const float* gamma,
   // projection: half the bytes for the combine and the epilogue, and no
   // separate activation pass for the projection.
   xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
+  xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
   if (moe_pending_) {
     // The MoE epilogue was deferred to this combine (see Moe).
     moe_pending_ = false;
@@ -1253,6 +1297,15 @@ void Executor::Combine(float* res, const float* gamma,
                  stream_);
     return;
   }
+  // A decode batch's next mixer quantizes xn for its down projection: the
+  // combine writes those rows as well.
+  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
+      HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
+                    s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
+                    stream_)) {
+    xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
+    return;
+  }
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
             c.hidden_size, c.hc_count, c.rms_eps, stream_);
 }
@@ -1261,15 +1314,17 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
                      std::string* error_msg) const {
   const Config& c = config();
+  mixed_q8_ready_ = {};  // `mixed` is rewritten below
   const bool marks = inject != nullptr;  // the head mixer is its own phase
   if (marks && !normed) {
     PS_MARK(kMixNorm);
   }
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
-  // wide route or as F32 in s_.xn.
+  // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
   if (!normed) {
     xn_half_ = false;
+    xn_q8_ready_ = {};
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
@@ -1372,8 +1427,15 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                       mixed, inject, n_tokens, c.hidden_size, c.hc_count,
                       stream_);
   } else {
+    // A decode batch's projections of `mixed` share its Q8_1 rows, which
+    // the epilogue writes as it stores them.
+    const bool q8 = !MatrixRows(n_tokens) && UnpaddedQ8(c.hidden_size);
     HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_);
+                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_,
+                  q8 ? s_.mixed_q8_1 : nullptr);
+    if (q8) {
+      mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
+    }
   }
   inject_parts_ = fused_inject ? (vectorized ? HcInjectPartsVec4(c.hidden_size)
                                              : HcInjectParts(c.hidden_size))
@@ -1382,6 +1444,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     // A quantized inject projection (the draft block's) reads an F32 norm;
     // on the wide route the combine only produced F16, so norm again.
     if (xn_half_) {
+      xn_q8_ready_ = {};
       RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                   c.rms_eps, stream_);
     }
@@ -1581,6 +1644,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
   auto* out_half =
       half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
+  // A decode batch's output projection reads the epilogue's Q8_1 rows.
+  const std::uint32_t value_dim = c.SsmValueDim();
+  const bool out_q8_1 = project_output && !tiled && !MatrixRows(n_tokens) &&
+                        c.ssm_head_dim == 128 &&
+                        l.ssm_out.type == GgmlType::kQ8_0 &&
+                        l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
                 s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
@@ -1589,7 +1658,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 speculative ? s.conv_snapshots : RollbackRows{}, n_tokens,
                 c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
                 c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
-                convolved, c.rms_eps, stream_, out_half);
+                convolved, c.rms_eps, stream_, out_half,
+                out_q8_1 ? s_.gdn_q8_1 : nullptr);
   if (!project_output) {
     return true;
   }
@@ -1610,6 +1680,11 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       return false;
     }
     return true;
+  }
+  if (out_q8_1) {
+    return Dense(l.ssm_out,
+                 Q8Input{s_.gdn_out, s_.gdn_q8_1, n_tokens, value_dim}, out,
+                 error_msg);
   }
   return Dense(l.ssm_out, s_.gdn_out, out, n_tokens, error_msg);
 }
@@ -1756,8 +1831,17 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
                   pos, c.num_heads, c.num_kv_heads, c.head_dim,
                   c.compress_ratio, stream_);
-  SigmoidMul(s_.ctx, s_.attn_gate,
-             static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
+  const std::uint32_t q_dim = c.AttentionQDim();
+  const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+  // A decode batch's output projection reads the gate's Q8_1 rows.
+  if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
+      l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
+      SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {
+    PS_MARK(kAttnOut);
+    return Dense(l.attn_out, Q8Input{s_.ctx, s_.ctx_q8_1, n_tokens, q_dim}, out,
+                 error_msg);
+  }
+  SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
   if (project_output) {
     PS_MARK(kAttnOut);
   }
@@ -2096,6 +2180,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
+  DropReadyQ8();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (n == 0 || n > options_.max_batch ||
@@ -2947,6 +3032,7 @@ bool Executor::MtpForward(Session& session,
                           std::string* error_msg,
                           const float* hidden_source) const {
   verify_candidates_ready_ = 0;
+  DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (session.owner_ != this ||
       std::any_of(tokens.begin(), tokens.end(), [&](auto t) {
