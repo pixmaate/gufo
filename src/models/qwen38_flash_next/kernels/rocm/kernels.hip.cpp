@@ -5590,7 +5590,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope) {
-  if (n_tokens < 1024 || weights == nullptr || input == nullptr ||
+  if (n_tokens == 0 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr)
@@ -5690,7 +5690,7 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
                      hipStream_t stream) {
-  if (n_tokens < 1024 || m != 16384 || k != 2560 || channels != 10240 ||
+  if (n_tokens == 0 || m != 16384 || k != 2560 || channels != 10240 ||
       kernel != kSsmConvTaps) {
     return false;
   }
