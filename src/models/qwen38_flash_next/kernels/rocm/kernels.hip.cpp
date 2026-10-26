@@ -1147,6 +1147,18 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
       }
 #pragma unroll
       for (unsigned j = 0; j < tokens; ++j) {
+        if constexpr (kWhole && type != WeightType::kF32) {
+          // The 16-bit rows' checked loop compiles to one fma chain straight
+          // into acc, at every width; pinned here so the vector-load route
+          // keeps those bits (fast-math regroups an unpinned chain).
+          float s = acc[j];
+#pragma unroll
+          for (unsigned r = 0; r < 4; ++r) {
+            s = Materialize(__builtin_fmaf(wv[st][r], xv[st][j][r], s));
+          }
+          acc[j] = s;
+          continue;
+        }
         // Four products per step, then added to acc: the exact grouping of
         // the one-step loop, so the sum stays bit for bit the same.
         float dot = 0.0f;
