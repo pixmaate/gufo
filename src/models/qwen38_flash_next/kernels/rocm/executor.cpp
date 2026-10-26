@@ -99,11 +99,13 @@ bool MatrixRows(std::uint32_t rows) {
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
 }
-/// Prefill passes wider than a vector batch take the fused projections and
-/// the paired routed expert tiles: they win from 9 rows up to the full chunk.
+/// Prefill passes from this width take the fused projections and the paired
+/// routed expert tiles. Measured on Windows (MTP on): 16-128 rows lose 3-4.5%
+/// on them, 192 is even, 256 gains 2.5%, 320-1023 gain 6-7.5%.
+constexpr std::uint32_t kWidePrefillMinRows = 192;
 /// Decode and verification batches keep their single-token arithmetic.
 bool WidePrefill(std::uint32_t rows) {
-  return prefill_phase && rows > kVecBatch;
+  return prefill_phase && rows >= kWidePrefillMinRows;
 }
 
 /// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
