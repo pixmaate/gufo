@@ -1147,10 +1147,11 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
       }
 #pragma unroll
       for (unsigned j = 0; j < tokens; ++j) {
-        if constexpr (kWhole && type != WeightType::kF32) {
-          // The 16-bit rows' checked loop compiles to one fma chain straight
-          // into acc, at every width; pinned here so the vector-load route
-          // keeps those bits (fast-math regroups an unpinned chain).
+        if constexpr (type == WeightType::kF16 || type == WeightType::kBF16) {
+          // The original one-step loop compiled 16-bit rows to one fma chain
+          // straight into acc, at every width; pinned here for both routes
+          // (vector loads and the checked/grouped prefill loop), since
+          // fast-math regroups an unpinned chain.
           float s = acc[j];
 #pragma unroll
           for (unsigned r = 0; r < 4; ++r) {
