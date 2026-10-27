@@ -1188,7 +1188,8 @@ ParsedGeneration ParseGeneration(
       }
       parsed.text = std::string(content);
     }
-  } else {
+  } else if (initial_output_state ==
+             TextGenerationBackend::InitialOutputState::kAuto) {
     const std::size_t think_start = content.find(kThinkStart);
     if (think_start != std::string_view::npos) {
       const std::size_t think_content_start = think_start + kThinkStart.size();
@@ -1223,6 +1224,10 @@ ParsedGeneration ParseGeneration(
     } else {
       parsed.text = std::string(content);
     }
+  } else {
+    // Thinking is disabled: literal reasoning tags are answer text, as the
+    // streaming filter already treats them.
+    parsed.text = std::string(content);
   }
 
   const std::size_t marker = EarliestMarker(parsed.text);
