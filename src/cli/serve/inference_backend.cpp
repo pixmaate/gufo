@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +22,7 @@
 #include <utility>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/prompt_trace.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -52,6 +54,70 @@ using Clock = std::chrono::steady_clock;
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
     *error = std::move(message);
+  }
+}
+
+std::size_t CountOccurrences(std::string_view text, std::string_view needle) {
+  std::size_t count = 0;
+  for (auto at = text.find(needle); at != std::string_view::npos;
+       at = text.find(needle, at + needle.size()))
+    ++count;
+  return count;
+}
+
+// --trace: what the harness sent (a summary per message, repeated user texts)
+// and the exact prompt the model reads. "<|im_start|>" appearing more often in
+// the text than as a token means a message carried that markup as content.
+void TracePrompt(const TextModelRunner& runner, const ChatRequest& request,
+                 std::span<const TextRunnerToken> tokens,
+                 const std::string& client_id) {
+  try {
+    json::Value line = json::Value::object();
+    line["time"] = static_cast<long long>(std::time(nullptr));
+    line["client_id"] = client_id;
+    line["prompt_tokens"] = static_cast<unsigned long>(tokens.size());
+    line["cache_prompt"] = request.cache_prompt;
+    line["tools"] = static_cast<unsigned long>(request.tools.size());
+    json::Value messages = json::Value::array();
+    std::vector<std::string_view> user_texts;
+    std::size_t repeated_user = 0;
+    for (const auto& message : request.messages) {
+      json::Value item = json::Value::object();
+      item["role"] = std::string(tokenization::ToString(message.role));
+      item["chars"] = static_cast<unsigned long>(message.content.size());
+      item["head"] = message.content.substr(0, 160);
+      if (!message.thought.empty())
+        item["reasoning_chars"] =
+            static_cast<unsigned long>(message.thought.size());
+      if (!message.tool_calls.empty())
+        item["tool_calls"] =
+            static_cast<unsigned long>(message.tool_calls.size());
+      if (message.role == tokenization::ChatRole::kUser) {
+        if (std::ranges::find(user_texts, std::string_view(message.content)) !=
+            user_texts.end()) {
+          ++repeated_user;
+          item["repeats_earlier_user_message"] = true;
+        }
+        user_texts.emplace_back(message.content);
+      }
+      messages.push_back(std::move(item));
+    }
+    line["messages"] = std::move(messages);
+    line["repeated_user_messages"] = static_cast<unsigned long>(repeated_user);
+    const std::string prompt = runner.Decode(tokens);
+    const auto marker = runner.Tokenize("<|im_start|>");
+    std::size_t marker_tokens = 0;
+    if (marker.size() == 1)
+      marker_tokens = static_cast<std::size_t>(
+          std::ranges::count(tokens, marker.front()));
+    line["im_start_tokens"] = static_cast<unsigned long>(marker_tokens);
+    line["im_start_in_text"] =
+        static_cast<unsigned long>(CountOccurrences(prompt, "<|im_start|>"));
+    line["prompt"] = prompt;
+    PromptTrace::Write(line.dump());
+  } catch (const std::exception& error) {
+    Logger::Warn("trace", std::string("event=trace_failed reason=") +
+                              error.what());
   }
 }
 
@@ -3586,6 +3652,8 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
+  if (PromptTrace::Enabled())
+    TracePrompt(state->scheduler->runner(), request, prompt->tokens, client_id);
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, sampling_config, is_cancelled,
       stream_output,

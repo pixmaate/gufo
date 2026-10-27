@@ -29,6 +29,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/prompt_trace.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -944,6 +945,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
+    std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
@@ -1058,6 +1060,11 @@ int RunServe(std::span<const char* const> args) {
         "RAM limit for queued snapshots and each disk read "
         "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
+    llm_parser.AddOption(
+        "", "--trace", "PATH",
+        "Append every chat request's message summary and exact rendered "
+        "prompt to PATH as JSON Lines (holds client content; off by default)",
+        "Logging", &trace_path);
 
     add_server_options(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
@@ -1097,6 +1104,16 @@ int RunServe(std::span<const char* const> args) {
         draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
+    }
+    // Opened before the model loads, so a bad path fails at once.
+    if (!trace_path.empty()) {
+      if (const auto error = server::PromptTrace::Open(trace_path)) {
+        std::cerr << "Error: cannot open --trace file '" << trace_path
+                  << "': " << *error << "\n";
+        return 2;
+      }
+      server::Logger::Warn("trace", "event=trace_enabled path=" + trace_path +
+                                        " content=messages,prompts");
     }
     const auto reasoning_defaults = ResolveReasoningDefaults(
         reasoning_mode, reasoning_effort, preserve_thinking, &parse_err);
