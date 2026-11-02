@@ -57,6 +57,16 @@ void SetError(std::string* error, std::string message) {
   }
 }
 
+// At most `bytes` bytes of `text`, never ending inside a UTF-8 sequence.
+std::string_view Utf8Prefix(std::string_view text, std::size_t bytes) {
+  if (text.size() <= bytes)
+    return text;
+  while (bytes > 0 &&
+         (static_cast<unsigned char>(text[bytes]) & 0xC0) == 0x80)
+    --bytes;
+  return text.substr(0, bytes);
+}
+
 std::size_t CountOccurrences(std::string_view text, std::string_view needle) {
   std::size_t count = 0;
   for (auto at = text.find(needle); at != std::string_view::npos;
@@ -85,7 +95,7 @@ void TracePrompt(const TextModelRunner& runner, const ChatRequest& request,
       json::Value item = json::Value::object();
       item["role"] = std::string(tokenization::ToString(message.role));
       item["chars"] = static_cast<unsigned long>(message.content.size());
-      item["head"] = message.content.substr(0, 160);
+      item["head"] = std::string(Utf8Prefix(message.content, 160));
       if (!message.thought.empty())
         item["reasoning_chars"] =
             static_cast<unsigned long>(message.thought.size());
