@@ -563,8 +563,9 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
         (static_cast<std::size_t>(t) * streams + s) * hidden;
     float* dst0 = res + base0;
     const float* src0 = block_out + static_cast<std::size_t>(t) * hidden;
-    const float* g0 =
-        gamma == nullptr ? nullptr : gamma + static_cast<std::size_t>(s) * hidden;
+    const float* g0 = gamma == nullptr
+                          ? nullptr
+                          : gamma + static_cast<std::size_t>(s) * hidden;
     float r[kMaxPer];
     float b[kMaxPer];
     float gg[kMaxPer];
@@ -580,7 +581,8 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
     float logit0 = 0.0f;
     for (std::uint32_t p = 0; p < inject_parts; ++p) {
       logit0 +=
-          inject[(static_cast<std::size_t>(t) * streams + s) * inject_parts + p];
+          inject[(static_cast<std::size_t>(t) * streams + s) * inject_parts +
+                 p];
     }
     const float w0 = 2.0f * SigmoidF(logit0 / static_cast<float>(streams));
     float ss0 = 0.0f;

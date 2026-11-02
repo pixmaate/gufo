@@ -1322,7 +1322,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
                      std::string* error_msg) const {
   const Config& c = config();
-  mixed_q8_ready_ = {};  // `mixed` is rewritten below
+  mixed_q8_ready_ = {};                  // `mixed` is rewritten below
   const bool marks = inject != nullptr;  // the head mixer is its own phase
   if (marks && !normed) {
     PS_MARK(kMixNorm);
@@ -2305,10 +2305,10 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     if (phased) {
       Ps().BeginBody(key, stream_);
     }
-    const bool ok = ForwardBody(
-        session, n, n_logits, logits != nullptr, speculative, sparse, start_pos,
-        graph ? graph_pool_grid : pool_grid, first_layer, c.num_layers,
-        error_msg);
+    const bool ok =
+        ForwardBody(session, n, n_logits, logits != nullptr, speculative,
+                    sparse, start_pos, graph ? graph_pool_grid : pool_grid,
+                    first_layer, c.num_layers, error_msg);
     if (phased) {
       Ps().EndBody(stream_);
     }
@@ -3097,10 +3097,9 @@ bool Executor::MtpForward(Session& session,
     if (phased) {
       Ps().BeginBody(key, stream_);
     }
-    const bool ok = MtpBody(session, n, pos, output.token != nullptr,
-                            output.candidates != nullptr, error_msg,
-                            graph ? graph_pool : pool, hidden_source,
-                            output.trace);
+    const bool ok = MtpBody(
+        session, n, pos, output.token != nullptr, output.candidates != nullptr,
+        error_msg, graph ? graph_pool : pool, hidden_source, output.trace);
     if (phased) {
       Ps().EndBody(stream_);
     }

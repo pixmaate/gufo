@@ -61,8 +61,7 @@ void SetError(std::string* error, std::string message) {
 std::string_view Utf8Prefix(std::string_view text, std::size_t bytes) {
   if (text.size() <= bytes)
     return text;
-  while (bytes > 0 &&
-         (static_cast<unsigned char>(text[bytes]) & 0xC0) == 0x80)
+  while (bytes > 0 && (static_cast<unsigned char>(text[bytes]) & 0xC0) == 0x80)
     --bytes;
   return text.substr(0, bytes);
 }
@@ -118,16 +117,16 @@ void TracePrompt(const TextModelRunner& runner, const ChatRequest& request,
     const auto marker = runner.Tokenize("<|im_start|>");
     std::size_t marker_tokens = 0;
     if (marker.size() == 1)
-      marker_tokens = static_cast<std::size_t>(
-          std::ranges::count(tokens, marker.front()));
+      marker_tokens =
+          static_cast<std::size_t>(std::ranges::count(tokens, marker.front()));
     line["im_start_tokens"] = static_cast<unsigned long>(marker_tokens);
     line["im_start_in_text"] =
         static_cast<unsigned long>(CountOccurrences(prompt, "<|im_start|>"));
     line["prompt"] = prompt;
     PromptTrace::Write(line.dump());
   } catch (const std::exception& error) {
-    Logger::Warn("trace", std::string("event=trace_failed reason=") +
-                              error.what());
+    Logger::Warn("trace",
+                 std::string("event=trace_failed reason=") + error.what());
   }
 }
 

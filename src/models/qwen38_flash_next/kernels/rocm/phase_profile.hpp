@@ -29,24 +29,24 @@ public:
   enum Phase : int {
     kSetup,
     kPle,
-    kMixNorm,    // F32 grouped norm (unnormed mixers only)
-    kMixDown,    // quantize + down GEMV (+ fused SiLU)
-    kMixUp,      // quantize + up GEMV
-    kMixEpi,     // epilogue (mixed + inject)
-    kGdnIn,      // quantize + qkv + gate GEMVs
-    kGdnAb,      // alpha/beta F16 GEMV
-    kGdnCore,    // conv, prep, recurrence, norm/gate
-    kGdnOut,     // quantize + output GEMV
-    kAttnProj,   // qkv GEMV + norm/rope/store
-    kAttnCore,   // indexer, attention, sigmoid gate
-    kAttnOut,    // output projection
+    kMixNorm,   // F32 grouped norm (unnormed mixers only)
+    kMixDown,   // quantize + down GEMV (+ fused SiLU)
+    kMixUp,     // quantize + up GEMV
+    kMixEpi,    // epilogue (mixed + inject)
+    kGdnIn,     // quantize + qkv + gate GEMVs
+    kGdnAb,     // alpha/beta F16 GEMV
+    kGdnCore,   // conv, prep, recurrence, norm/gate
+    kGdnOut,    // quantize + output GEMV
+    kAttnProj,  // qkv GEMV + norm/rope/store
+    kAttnCore,  // indexer, attention, sigmoid gate
+    kAttnOut,   // output projection
     kCombine,
-    kRouter,     // F32 router GEMV + top-k
-    kShared,     // shared expert gate/up + down
-    kRouted,     // routed gate/up (quantize + gated GEMV)
+    kRouter,  // F32 router GEMV + top-k
+    kShared,  // shared expert gate/up + down
+    kRouted,  // routed gate/up (quantize + gated GEMV)
     kHeadMix,
-    kHead,       // LM head
-    kCand,       // candidate selection + copies
+    kHead,        // LM head
+    kCand,        // candidate selection + copies
     kRoutedDown,  // routed down (quantize + GEMV)
     kRoutedEpi,   // MoE epilogue
     kMtpIn,       // draft step: embedding, norms, fc projections
@@ -130,8 +130,8 @@ private:
     enabled_ = v != nullptr && v[0] != '\0' && v[0] != '0';
     int device = 0, khz = 0;
     if (enabled_ && hipGetDevice(&device) == hipSuccess &&
-        hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
-                              device) == hipSuccess &&
+        hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device) ==
+            hipSuccess &&
         khz > 0) {
       ns_per_tick_ = 1e6 / khz;
     }
@@ -139,11 +139,10 @@ private:
   }
   void Report() {
     static constexpr const char* kNames[kCount] = {
-        "setup",     "ple",       "mix-norm", "mix-down", "mix-up",
-        "mix-epi",   "gdn-in",    "gdn-ab",   "gdn-core", "gdn-out",
-        "attn-proj", "attn-core", "attn-out", "combine",  "router",
-        "shared",    "routed",    "head-mix", "head",     "cand",
-        "r-down",    "r-epi",     "mtp-in"};
+        "setup",    "ple",     "mix-norm", "mix-down", "mix-up",    "mix-epi",
+        "gdn-in",   "gdn-ab",  "gdn-core", "gdn-out",  "attn-proj", "attn-core",
+        "attn-out", "combine", "router",   "shared",   "routed",    "head-mix",
+        "head",     "cand",    "r-down",   "r-epi",    "mtp-in"};
     for (std::uint32_t w = 0; w <= 8; ++w) {
       Stats& s = stats_[w];
       if (s.passes == 0) {
@@ -180,7 +179,9 @@ private:
   std::chrono::steady_clock::time_point since_;
 };
 
-inline PhaseStamps& Ps() { return PhaseStamps::Get(); }
+inline PhaseStamps& Ps() {
+  return PhaseStamps::Get();
+}
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
