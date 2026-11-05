@@ -72,6 +72,13 @@ struct ScheduledRequest {
 
   std::atomic<bool> cancellation_requested{false};
   std::atomic<TextRequestPhase> phase{TextRequestPhase::kQueued};
+  // Monitoring mirrors of the counters below. The worker thread is the only
+  // writer and readers (the dashboard `/dashboard/status` endpoint) never touch
+  // `result` directly, so a snapshot cannot race the scheduler.
+  std::atomic<std::size_t> live_prompt_tokens{0};
+  std::atomic<std::size_t> live_cached_tokens{0};
+  std::atomic<std::size_t> live_prefill_tokens{0};
+  std::atomic<std::size_t> live_generated_tokens{0};
 
   TextRunnerPool::Request runner_request;
   TextGenerationScheduler::Result result;
@@ -301,6 +308,49 @@ struct TextGenerationScheduler::Impl {
     return snapshot;
   }
 
+  /// Prunes finished entries so the monitoring registry stays bounded even
+  /// when nothing polls it. Caller holds `queue_mutex`.
+  void PruneLive() {
+    std::erase_if(live, [](const std::weak_ptr<ScheduledRequest>& weak) {
+      const auto request = weak.lock();
+      return request == nullptr || IsTerminal(request);
+    });
+  }
+
+  [[nodiscard]] std::vector<TextRequestProgress> Progress() const {
+    const std::lock_guard<std::mutex> lock(queue_mutex);
+    std::vector<TextRequestProgress> snapshot;
+    snapshot.reserve(live.size());
+    const auto now = Clock::now();
+    for (const auto& weak : live) {
+      const auto request = weak.lock();
+      if (request == nullptr) {
+        continue;
+      }
+      const auto phase = request->phase.load(std::memory_order_acquire);
+      if (phase == TextRequestPhase::kTerminal) {
+        continue;
+      }
+      TextRequestProgress progress;
+      progress.id = request->id;
+      progress.client_id = request->client_id;
+      progress.phase = phase;
+      progress.prompt_tokens =
+          request->live_prompt_tokens.load(std::memory_order_relaxed);
+      progress.cached_prompt_tokens =
+          request->live_cached_tokens.load(std::memory_order_relaxed);
+      progress.prefill_tokens =
+          request->live_prefill_tokens.load(std::memory_order_relaxed);
+      progress.generated_tokens =
+          request->live_generated_tokens.load(std::memory_order_relaxed);
+      progress.elapsed_ms = std::chrono::duration<double, std::milli>(
+                                now - request->request_start)
+                                .count();
+      snapshot.push_back(std::move(progress));
+    }
+    return snapshot;
+  }
+
   void FinalizeResult(const std::shared_ptr<ScheduledRequest>& request,
                       TextGenerationBackend::FinishReason finish_reason) {
     request->result.completion_tokens = request->result.tokens.size();
@@ -460,6 +510,8 @@ struct TextGenerationScheduler::Impl {
         request->result.cache_checkpoint_tokens = lookup.checkpoint_tokens;
         request->result.cached_prompt_tokens =
             request->runner_request.cached_prompt_tokens();
+        request->live_cached_tokens.store(request->result.cached_prompt_tokens,
+                                          std::memory_order_relaxed);
         request->result.cache_restore_bytes =
             request->runner_request.cache_restore_bytes();
         request->result.cache_restore_ms =
@@ -519,6 +571,8 @@ struct TextGenerationScheduler::Impl {
           std::chrono::duration<double, std::milli>(Clock::now() - start)
               .count();
       request->result.prefill_tokens += step.consumed_tokens;
+      request->live_prefill_tokens.store(request->result.prefill_tokens,
+                                         std::memory_order_relaxed);
       ++request->result.prefill_chunks;
       request->result.max_prefill_chunk_tokens = std::max(
           request->result.max_prefill_chunk_tokens, step.consumed_tokens);
@@ -620,6 +674,8 @@ struct TextGenerationScheduler::Impl {
     }
     request->generated_output_bytes += selection.piece.size();
     request->result.tokens.push_back(selection.token);
+    request->live_generated_tokens.store(request->result.tokens.size(),
+                                         std::memory_order_relaxed);
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
                            : selection.piece;
@@ -1203,6 +1259,9 @@ struct TextGenerationScheduler::Impl {
   std::condition_variable queue_condition;
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
+  /// Non-terminal requests in arrival order, for monitoring snapshots. Guarded
+  /// by `queue_mutex`; entries are pruned when they expire or finish.
+  std::vector<std::weak_ptr<ScheduledRequest>> live;
   bool stopping{false};
   std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
@@ -1345,6 +1404,10 @@ std::size_t TextGenerationScheduler::max_buffered_output_bytes()
       std::memory_order_relaxed);
 }
 
+std::vector<TextRequestProgress> TextGenerationScheduler::progress() const {
+  return impl_->Progress();
+}
+
 TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling,
@@ -1381,6 +1444,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
   request->result.prompt_tokens = prompt.size();
+  request->live_prompt_tokens.store(prompt.size(), std::memory_order_relaxed);
   request->result.client_id = request->client_id;
   request->result.configured_active_prefill_tokens =
       impl_->prefill_policy.decode_active_tokens;
@@ -1442,6 +1506,10 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     request->result.client_queue_depth_at_submit = client->requests.size() + 1;
     client->requests.push_back(request);
     ++impl_->queued_count;
+    impl_->live.push_back(request);
+    if (impl_->live.size() > 64) {
+      impl_->PruneLive();
+    }
   }
   impl_->queue_condition.notify_one();
   return Request(std::make_unique<Request::Impl>(std::move(request)));

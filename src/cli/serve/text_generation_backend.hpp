@@ -131,6 +131,30 @@ public:
     sampling::SamplingConfig sampling;
   };
 
+  /// Loaded-model configuration surfaced for the dashboard status endpoint;
+  /// never used to change execution.
+  struct ModelInfo {
+    std::uint32_t context{0};
+    std::size_t sessions{1};
+    std::string speculative{"off"};
+  };
+
+  /// Live state of a generation this backend is still working on, for
+  /// monitoring only. `phase` is "queued", "admitted", "prefilling",
+  /// "decode_ready" or "decoding"; the prompt work still pending is
+  /// `prompt_tokens - cached_prompt_tokens - prefill_tokens`.
+  struct ActiveGeneration {
+    /// Transport-derived peer address of the requesting client, matching
+    /// `Result::client_id`; never a caller-supplied identity.
+    std::string client{"anonymous"};
+    std::string phase;
+    std::size_t prompt_tokens{0};
+    std::size_t cached_prompt_tokens{0};
+    std::size_t prefill_tokens{0};
+    std::size_t generated_tokens{0};
+    double elapsed_ms{0.0};
+  };
+
   struct Result {
     std::string text;
     std::vector<tokenization::TokenId> tokens;
@@ -212,6 +236,13 @@ public:
   [[nodiscard]] virtual std::string model_id() const = 0;
   [[nodiscard]] virtual bool ready() const = 0;
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
+    return {};
+  }
+  [[nodiscard]] virtual ModelInfo model_info() const { return ModelInfo{}; }
+  /// Generations still in flight, oldest first. Monitoring only: the default
+  /// reports none so backends without a scheduler stay unchanged.
+  [[nodiscard]] virtual std::vector<ActiveGeneration> active_generations()
+      const {
     return {};
   }
   [[nodiscard]] virtual ReasoningOptions reasoning_defaults() const {

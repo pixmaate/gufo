@@ -228,8 +228,26 @@ add_library(gufo_http STATIC
   src/cli/serve/asr_websocket.cpp
   src/cli/serve/tts_websocket.cpp
   src/cli/serve/openai_chat.cpp
+  src/cli/serve/dashboard_recorder.cpp
+  src/cli/serve/dashboard_telemetry.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/gufo_dashboard_html.cpp
+  COMMAND ${CMAKE_COMMAND}
+    -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/web/dashboard.html
+    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generated/gufo_dashboard_html.cpp
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/cli/serve/web/dashboard.html
+          ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake
+  COMMENT "Embedding dashboard page"
+  VERBATIM)
+target_sources(gufo_http PRIVATE
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/gufo_dashboard_html.cpp)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts
+  gufo_qwen3_asr gufo_qwen_image_21 gufo_diagnostics)
+if (WIN32)
+  target_link_libraries(gufo_http PRIVATE pdh)
+endif()
 
 add_executable(gufo
   src/cli/main.cpp
@@ -402,6 +420,7 @@ if (BUILD_TESTING)
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
     src/cli/serve/openai_chat.cpp
+    src/cli/serve/dashboard_recorder.cpp
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core gufo_logging)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
@@ -412,6 +431,11 @@ if (BUILD_TESTING)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
+  add_executable(dashboard_test tests/cli/dashboard_test.cpp)
+  target_link_libraries(dashboard_test PRIVATE gufo_http)
+  add_test(NAME dashboard_test COMMAND dashboard_test)
+  set_tests_properties(dashboard_test PROPERTIES
+    LABELS "cpu;server;dashboard" TIMEOUT 30)
   add_executable(audio_websocket_test tests/cli/audio_websocket_test.cpp)
   target_link_libraries(audio_websocket_test PRIVATE gufo_http)
   add_test(NAME audio_websocket_test COMMAND audio_websocket_test)

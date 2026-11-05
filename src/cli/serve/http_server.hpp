@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/dashboard_recorder.hpp"
+#include "src/cli/serve/dashboard_telemetry.hpp"
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 
@@ -142,6 +144,7 @@ private:
   std::mutex workers_mutex_;
   std::vector<std::unique_ptr<ConnectionWorker>> workers_;
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;
+  std::unique_ptr<dashboard::TelemetrySampler> telemetry_;
 };
 
 namespace detail {
@@ -183,6 +186,7 @@ inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
   if (tok_per_sec > 0.0) {
     detail::LastGenSpeed().store(tok_per_sec, std::memory_order_relaxed);
   }
+  dashboard::Recorder().note_generation(result);
 }
 
 }  // namespace gufo::server

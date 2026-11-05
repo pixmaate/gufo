@@ -24,6 +24,42 @@ enum class TextRequestPhase : std::uint8_t {
   kTerminal,
 };
 
+/// Monitoring view of one request the scheduler still owns. The scheduler
+/// thread publishes these counters as it works, so `prefill_tokens` grows
+/// while a prompt is being processed and `generated_tokens` grows while the
+/// request decodes. The remaining prefill work is
+/// `prompt_tokens - cached_prompt_tokens - prefill_tokens`.
+struct TextRequestProgress {
+  std::uint64_t id{0};
+  std::string client_id{"anonymous"};
+  TextRequestPhase phase{TextRequestPhase::kQueued};
+  std::size_t prompt_tokens{0};
+  std::size_t cached_prompt_tokens{0};
+  std::size_t prefill_tokens{0};
+  std::size_t generated_tokens{0};
+  double elapsed_ms{0.0};
+};
+
+/// Stable names for phases, used by the dashboard `/dashboard/status`.
+[[nodiscard]] inline const char* TextRequestPhaseName(
+    TextRequestPhase phase) noexcept {
+  switch (phase) {
+    case TextRequestPhase::kQueued:
+      return "queued";
+    case TextRequestPhase::kAdmitted:
+      return "admitted";
+    case TextRequestPhase::kPrefilling:
+      return "prefilling";
+    case TextRequestPhase::kDecodeReady:
+      return "decode_ready";
+    case TextRequestPhase::kDecoding:
+      return "decoding";
+    case TextRequestPhase::kTerminal:
+      break;
+  }
+  return "terminal";
+}
+
 inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
 inline constexpr std::size_t kDefaultMaxOutputBytes =
     static_cast<std::size_t>(1024) * 1024;
@@ -109,6 +145,11 @@ public:
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
+
+  /// Requests the scheduler still owns (queued through decoding), oldest first.
+  /// Monitoring only: the snapshot never blocks the worker and never changes
+  /// execution.
+  [[nodiscard]] std::vector<TextRequestProgress> progress() const;
 
   [[nodiscard]] Request Submit(std::vector<TextRunnerToken> prompt,
                                std::size_t max_tokens,

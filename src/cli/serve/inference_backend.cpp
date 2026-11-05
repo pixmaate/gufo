@@ -2804,6 +2804,23 @@ private:
 
 }  // namespace
 
+namespace {
+[[maybe_unused]] constexpr std::string_view SpeculativeBackendName(
+    TextSpeculativeBackend backend) noexcept {
+  switch (backend) {
+    case TextSpeculativeBackend::kDisabled:
+      return "off";
+    case TextSpeculativeBackend::kDFlash:
+      return "dflash2";
+    case TextSpeculativeBackend::kDSpark:
+      return "dspark";
+    case TextSpeculativeBackend::kMtp:
+      return "mtp";
+  }
+  return "off";
+}
+}  // namespace
+
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
@@ -2811,6 +2828,8 @@ struct InferenceBackend::Impl {
     std::string model_id;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
+    std::size_t sessions{1};
+    std::string speculative{"off"};
     ReasoningOptions reasoning_defaults;
   };
 
@@ -3112,6 +3131,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       auto new_state = std::make_shared<Impl::State>();
       new_state->model_id = runner->Descriptor().model_id;
       new_state->max_context = runner->Descriptor().max_context;
+      new_state->sessions = session_count;
+      new_state->speculative =
+          std::string(SpeculativeBackendName(speculative_config.backend));
       auto runner_pool =
           std::make_shared<TextRunnerPool>(std::move(runner), session_count);
       new_state->scheduler = std::make_shared<TextGenerationScheduler>(
@@ -3283,6 +3305,9 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
+    new_state->sessions = session_count;
+    new_state->speculative =
+        std::string(SpeculativeBackendName(speculative_config.backend));
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
       runner_disk_cache = TextRunnerDiskCacheOptions{
@@ -3367,6 +3392,9 @@ bool InferenceBackend::load(
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
+    new_state->sessions = session_count;
+    new_state->speculative =
+        std::string(SpeculativeBackendName(speculative_config.backend));
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
       runner_disk_cache = TextRunnerDiskCacheOptions{
@@ -3448,6 +3476,9 @@ bool InferenceBackend::load(
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
+    new_state->sessions = session_count;
+    new_state->speculative =
+        std::string(SpeculativeBackendName(speculative_config.backend));
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
       runner_disk_cache = TextRunnerDiskCacheOptions{
@@ -3495,6 +3526,47 @@ std::uint32_t InferenceBackend::max_context() const {
   return state != nullptr ? state->max_context : 0;
 #else
   return 0;
+#endif
+}
+
+InferenceBackend::ModelInfo InferenceBackend::model_info() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr) {
+    return ModelInfo{};
+  }
+  ModelInfo info;
+  info.context = state->max_context;
+  info.sessions = state->sessions;
+  info.speculative = state->speculative;
+  return info;
+#else
+  return ModelInfo{};
+#endif
+}
+
+std::vector<TextGenerationBackend::ActiveGeneration>
+InferenceBackend::active_generations() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->scheduler == nullptr) {
+    return {};
+  }
+  std::vector<ActiveGeneration> active;
+  for (const auto& progress : state->scheduler->progress()) {
+    ActiveGeneration entry;
+    entry.client = progress.client_id;
+    entry.phase = TextRequestPhaseName(progress.phase);
+    entry.prompt_tokens = progress.prompt_tokens;
+    entry.cached_prompt_tokens = progress.cached_prompt_tokens;
+    entry.prefill_tokens = progress.prefill_tokens;
+    entry.generated_tokens = progress.generated_tokens;
+    entry.elapsed_ms = progress.elapsed_ms;
+    active.push_back(std::move(entry));
+  }
+  return active;
+#else
+  return {};
 #endif
 }
 
